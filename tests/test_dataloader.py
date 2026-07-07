@@ -3,8 +3,13 @@ import torch
 from src.dataloader import get_pcap_dataloader
 
 def test_dataloader():
-    pcap_path = "/Users/shubhamtomar/Desktop/local_test.pcap"
-    
+    import sys
+    pcap_path = "local_test.pcap"
+    if len(sys.argv) > 1:
+        pcap_path = sys.argv[1]
+    elif not os.path.exists(pcap_path):
+        pcap_path = "/Users/shubhamtomar/Desktop/local_test.pcap"
+        
     if not os.path.exists(pcap_path):
         print(f"Error: Test PCAP not found at {pcap_path}")
         return
