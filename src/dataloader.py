@@ -4,7 +4,6 @@ import json
 import math
 import hashlib
 import datetime
-from collections import Counter
 import torch
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 from scapy.utils import RawPcapReader
@@ -17,14 +16,18 @@ class RawPcapIterableDataset(IterableDataset):
     It yields sequences of a fixed length (max_sequence_length), zero-padded at the end.
     Supports multi-process loading by partitioning packets among workers.
     
-    Data Provenance: Automatically hashes dataset and caches metadata manifests.
-    Ground Truth Helper: Extracts and writes known anomalies (SYN floods & entropy spikes) 
-    to a buffered CSV file for auditing.
+    Optimized:
+      1. Zero-Copy Tensor Striding via torch.as_strided() (O(1) memory view layouts).
+      2. Vectorized Shannon Entropy via torch.bincount (no Python loop / Counter).
+      3. Strict Trailing Remainder bounds calculation to prevent out-of-bounds.
+      4. Tensor cloning on yield to prevent OOM memory pointer leaks of large file chunks.
     """
-    def __init__(self, pcap_path, max_sequence_length=8192):
+    def __init__(self, pcap_path, max_sequence_length=8192, stride=None):
         super().__init__()
         self.pcap_path = pcap_path
         self.max_sequence_length = max_sequence_length
+        # Default stride to max_sequence_length (non-overlapping) if not specified
+        self.stride = stride if stride is not None else max_sequence_length
         self.file_hash = None
         self.cached_sequences = None
         
@@ -32,7 +35,7 @@ class RawPcapIterableDataset(IterableDataset):
         if not os.path.exists(pcap_path):
             raise FileNotFoundError(f"Target PCAP file not found at: {pcap_path}")
             
-        # 1. Load manifest cache or compute hash streaming-wise
+        # Load manifest cache or compute hash streaming-wise
         self._load_or_compute_hash()
 
     def _load_or_compute_hash(self):
@@ -95,13 +98,12 @@ class RawPcapIterableDataset(IterableDataset):
     def _calculate_packet_entropy(self, packet_data):
         if not packet_data:
             return 0.0
-        counts = Counter(packet_data)
-        total_len = len(packet_data)
-        entropy = 0.0
-        for count in counts.values():
-            p = count / total_len
-            entropy -= p * math.log2(p)
-        return entropy
+        # Vectorized Shannon Entropy via torch.bincount (no Python loop / Counter)
+        pkt_tensor = torch.tensor(list(packet_data), dtype=torch.long)
+        counts = torch.bincount(pkt_tensor, minlength=256).float()
+        probs = counts / len(packet_data)
+        entropy = -torch.sum(probs * torch.log2(probs + 1e-9))
+        return entropy.item()
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -123,18 +125,24 @@ class RawPcapIterableDataset(IterableDataset):
         if not file_exists:
             csv_writer.writerow(["pcap_file", "packet_index", "byte_offset", "anomaly_type", "entropy_value"])
 
+        # Configure sliding window and stride dimensions
+        W = self.max_sequence_length
+        S = self.stride
+        
+        # 10MB streaming chunks buffer limit
+        buffer_limit = 10 * 1024 * 1024 
+
         try:
             with RawPcapReader(self.pcap_path) as pcap_reader:
-                current_sequence = []
+                buffer = []
                 packet_index = 0
                 sequence_count = 0
                 byte_offset = 0
                 
                 for packet_data, _metadata in pcap_reader:
-                    # Increment global byte offset
                     packet_len = len(packet_data)
                     
-                    # 1. Ground Truth Anomaly Labeling & Analysis
+                    # 1. Vectorized Anomaly Labeling & Analysis
                     is_syn = False
                     try:
                         pkt = Ether(packet_data)
@@ -159,24 +167,53 @@ class RawPcapIterableDataset(IterableDataset):
                             f"{entropy:.4f}"
                         ])
 
-                    # 2. Yield sequence slicing for dataloader
+                    # 2. Accumulate packet bytes for partitioned worker
                     if packet_index % num_workers == worker_id:
-                        for byte in packet_data:
-                            current_sequence.append(byte)
-                            if len(current_sequence) == self.max_sequence_length:
-                                yield torch.tensor(current_sequence, dtype=torch.long)
-                                sequence_count += 1
-                                current_sequence = []
+                        buffer.extend(packet_data)
+                        
+                        # Process buffer if it exceeds the limit
+                        if len(buffer) >= buffer_limit:
+                            flat_bytes = torch.tensor(buffer, dtype=torch.long)
+                            N = len(flat_bytes)
+                            
+                            # Strict Trailing Remainder bounds calculation to prevent out-of-bounds
+                            num_windows = max(0, (N - W) // S + 1)
+                            if num_windows > 0:
+                                limit_bytes = num_windows * S + (W - S)
+                                windows = torch.as_strided(flat_bytes[:limit_bytes], size=(num_windows, W), stride=(S, 1))
+                                for window in windows:
+                                    # Tensor cloning on yield to prevent OOM memory pointer leaks
+                                    yield window.clone()
+                                    sequence_count += 1
+                                # Keep remainder
+                                buffer = buffer[num_windows * S:]
                                 
                     packet_index += 1
                     byte_offset += packet_len
                 
-                # Yield any remaining trailing bytes padded with 0x00
-                if current_sequence:
-                    remainder = self.max_sequence_length - len(current_sequence)
-                    current_sequence.extend([0] * remainder)
-                    yield torch.tensor(current_sequence, dtype=torch.long)
-                    sequence_count += 1
+                # Process remaining buffer at the end of the file
+                if len(buffer) > 0:
+                    flat_bytes = torch.tensor(buffer, dtype=torch.long)
+                    N = len(flat_bytes)
+                    num_windows = max(0, (N - W) // S + 1)
+                    
+                    if num_windows > 0:
+                        limit_bytes = num_windows * S + (W - S)
+                        windows = torch.as_strided(flat_bytes[:limit_bytes], size=(num_windows, W), stride=(S, 1))
+                        for window in windows:
+                            yield window.clone()
+                            sequence_count += 1
+                        remainder_start = num_windows * S
+                    else:
+                        remainder_start = 0
+                        
+                    # Yield trailing bytes padded with 0
+                    trailing = flat_bytes[remainder_start:]
+                    if len(trailing) > 0:
+                        pad_len = W - len(trailing)
+                        padded_tensor = torch.cat([trailing, torch.zeros(pad_len, dtype=torch.long)])
+                        yield padded_tensor.clone()
+                        sequence_count += 1
             
             # Atomic Manifest update when loading finishes (only write for main process / worker 0)
             if worker_id == 0:
@@ -185,9 +222,9 @@ class RawPcapIterableDataset(IterableDataset):
         finally:
             csv_file.close()
 
-def get_pcap_dataloader(pcap_path, batch_size=32, num_workers=0, max_sequence_length=8192):
+def get_pcap_dataloader(pcap_path, batch_size=32, num_workers=0, max_sequence_length=8192, stride=None):
     """
     Factory function to create a PyTorch DataLoader for the PCAP streaming dataset.
     """
-    dataset = RawPcapIterableDataset(pcap_path, max_sequence_length=max_sequence_length)
+    dataset = RawPcapIterableDataset(pcap_path, max_sequence_length=max_sequence_length, stride=stride)
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
