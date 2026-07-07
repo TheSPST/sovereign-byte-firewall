@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+import os
+import re
+import datetime
+import subprocess
+
+def update_context():
+    context_path = "PROJECT_CONTEXT.md"
+    if not os.path.exists(context_path):
+        print(f"Error: {context_path} not found.")
+        return
+
+    print("Running git hook: updating PROJECT_CONTEXT.md...")
+
+    # 1. Read existing content
+    with open(context_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # 2. Get current timestamp
+    local_tz_str = "+05:30"  # Match user's timezone offset
+    now_str = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + local_tz_str
+
+    # 3. Scan src/ and tests/ directories
+    src_files = []
+    test_files = []
+    if os.path.exists("src"):
+        src_files = [f for f in os.listdir("src") if os.path.isfile(os.path.join("src", f)) and not f.startswith(".")]
+    if os.path.exists("tests"):
+        test_files = [f for f in os.listdir("tests") if os.path.isfile(os.path.join("tests", f)) and not f.startswith(".")]
+
+    total_src_files = len(src_files)
+    total_test_files = len(test_files)
+
+    # 4. Generate catalog representation
+    catalog_lines = []
+    for f in sorted(src_files):
+        catalog_lines.append(f"  - `src/{f}`")
+    for f in sorted(test_files):
+        catalog_lines.append(f"  - `tests/{f}`")
+    catalog_str = "\n".join(catalog_lines)
+
+    # 5. Update Metadata section in content
+    content = re.sub(
+        r"- \*\*Last Updated:\*\* .*",
+        f"- **Last Updated:** {now_str}",
+        content
+    )
+
+    # 6. Update Project Codebase Statistics section in content
+    stats_replacement = f"""## 6. Project Codebase Statistics
+- **Total Source Files:** {total_src_files}
+- **Total Test Files:** {total_test_files}
+- **File Catalog:**
+{catalog_str}"""
+
+    content = re.compile(r"## 6\. Project Codebase Statistics.*", re.DOTALL).sub(stats_replacement, content)
+
+    # 7. Write back changes
+    with open(context_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    print("PROJECT_CONTEXT.md updated.")
+
+    # 8. Auto-stage PROJECT_CONTEXT.md so it is included in the commit
+    subprocess.run(["git", "add", context_path], check=True)
+    print("PROJECT_CONTEXT.md staged successfully.")
+
+if __name__ == "__main__":
+    update_context()
