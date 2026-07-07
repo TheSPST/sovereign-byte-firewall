@@ -46,7 +46,17 @@ def test_checkpoint_and_resume():
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     assert checkpoint['epoch'] == 1, f"Expected checkpoint epoch to be 1, got {checkpoint['epoch']}"
-    print("Phase 1 complete. Initial checkpoint successfully verified!")
+    
+    # Verify metadata integration
+    assert 'metadata' in checkpoint, "Error: Checkpoint metadata is missing!"
+    metadata = checkpoint['metadata']
+    assert metadata['model_version'] == "1.0.0", f"Expected model version '1.0.0', got {metadata['model_version']}"
+    assert metadata['epoch'] == 1, f"Expected metadata epoch to be 1, got {metadata['epoch']}"
+    
+    # Expected SHA-256 hash for local_test.pcap
+    expected_hash = "b9e851183f914c3d9562d5e5364a1a50446e80bc97bb9b6db86556611e91c67a"
+    assert metadata['dataset_hash'] == expected_hash, f"Expected dataset hash '{expected_hash}', got '{metadata['dataset_hash']}'"
+    print("Phase 1 complete. Initial checkpoint and metadata successfully verified!")
     
     # 4. Simulate Phase 2: Resume training to run Epoch 2 (total epochs = 2)
     print("\n--- Phase 2: Resuming training for a total of 2 epochs ---")
@@ -65,14 +75,23 @@ def test_checkpoint_and_resume():
     # Verify final checkpoint
     checkpoint_final = torch.load(checkpoint_path, map_location=device)
     assert checkpoint_final['epoch'] == 2, f"Expected final checkpoint epoch to be 2, got {checkpoint_final['epoch']}"
+    assert checkpoint_final['metadata']['epoch'] == 2, "Expected metadata epoch to update to 2"
     print("Phase 2 complete. Resume training and final checkpoint verified!")
     
-    # Clean up test checkpoints directory
+    # Verify telemetry logging
+    metrics_path = "logs/hardware_metrics.json"
+    assert os.path.exists(metrics_path), "Error: Telemetry metrics file 'logs/hardware_metrics.json' was not created!"
+    print("Telemetry metrics logged successfully! [OK]")
+    
+    # Clean up test checkpoints and telemetry logs
     if os.path.exists(checkpoint_dir):
         shutil.rmtree(checkpoint_dir)
         print("Test checkpoints cleaned up.")
+    if os.path.exists(metrics_path):
+        os.remove(metrics_path)
+        print("Telemetry logs cleaned up.")
         
-    print("\nTraining and Checkpointing Wrapper verification successfully complete!")
+    print("\nTraining, Checkpointing, and Telemetry verification successfully complete!")
 
 if __name__ == "__main__":
     test_checkpoint_and_resume()
