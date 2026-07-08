@@ -71,11 +71,34 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Evaluating using device: {device}")
 
-    # 4. Initialize model and load checkpoint
+    # 4. Load checkpoint and initialize model with matching parameters
     print(f"Loading checkpoint state from '{args.checkpoint_path}'...")
-    model = NetworkBytePatcher(max_patch_size=args.max_patch_size).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state'])
+    
+    state_dict = checkpoint['model_state']
+    
+    # Dynamically extract max_sequence_length from checkpoint's pos_embedding shape
+    pos_weight = state_dict.get('pos_embedding.weight', None)
+    if pos_weight is None:
+        pos_weight = state_dict.get('module.pos_embedding.weight', None)
+        
+    if pos_weight is not None:
+        max_seq_len = pos_weight.shape[0]
+    else:
+        max_seq_len = 8192
+        
+    print(f"Dynamic Shape Detection: max_sequence_length={max_seq_len}")
+    model = NetworkBytePatcher(max_patch_size=args.max_patch_size, max_sequence_length=max_seq_len).to(device)
+    
+    # Resilient loading mapping DataParallel module wrapper
+    is_dp = isinstance(model, torch.nn.DataParallel)
+    has_prefix = any(k.startswith('module.') for k in state_dict.keys())
+    if not is_dp and has_prefix:
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    elif is_dp and not has_prefix:
+        state_dict = {'module.' + k: v for k, v in state_dict.items()}
+        
+    model.load_state_dict(state_dict)
     model.eval()
 
     # 5. Extract a single sequence batch from the dataloader

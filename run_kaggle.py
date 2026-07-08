@@ -78,18 +78,11 @@ def parse_args():
         default=False,
         help="Bypass the CUDA GPU requirement (used for local CPU/MPS debugging)"
     )
-    parser.add_argument(
-        "--hf_token",
-        type=str,
-        default=os.environ.get("HF_TOKEN"),
-        help="Hugging Face User Access Token for private repositories (default: HF_TOKEN env var)"
-    )
     return parser.parse_args()
 
-def handle_data_download(dataset_path, dataset_url, hf_token=None):
+def handle_data_download(dataset_path, dataset_url):
     """
     Downloads dataset from Hugging Face / web if not already present.
-    Supports authenticated private downloads via huggingface_hub.
     """
     if os.path.exists(dataset_path):
         print(f"Dataset Status: Found local dataset at '{dataset_path}' [OK]")
@@ -99,62 +92,12 @@ def handle_data_download(dataset_path, dataset_url, hf_token=None):
         print(f"ERROR: Dataset not found at '{dataset_path}' and no --dataset_url was provided.", file=sys.stderr)
         sys.exit(1)
         
-    print(f"Dataset Status: Dataset missing. Initiating download...")
+    print(f"Dataset Status: Dataset missing. Downloading from: '{dataset_url}'...")
     os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
     
-    # Check if this is a Hugging Face URL and we should use huggingface_hub
-    if "huggingface.co" in dataset_url:
-        try:
-            # Parse repo_id, filename and repo_type from URL
-            # e.g., https://huggingface.co/datasets/username/repo/resolve/main/folder/file.pcap
-            parts = dataset_url.split("/")
-            if "datasets" in parts:
-                idx = parts.index("datasets")
-                repo_id = f"{parts[idx+1]}/{parts[idx+2]}"
-                resolve_idx = parts.index("resolve")
-                # Parts after main/
-                filename = "/".join(parts[resolve_idx+2:])
-                repo_type = "dataset"
-            else:
-                # Model repo
-                # e.g., https://huggingface.co/username/repo/resolve/main/file.pcap
-                resolve_idx = parts.index("resolve")
-                repo_id = f"{parts[resolve_idx-2]}/{parts[resolve_idx-1]}"
-                filename = "/".join(parts[resolve_idx+2:])
-                repo_type = "model"
-                
-            print(f"Hugging Face Hub Download:")
-            print(f"  -> Repo ID:   {repo_id}")
-            print(f"  -> Filename:  {filename}")
-            print(f"  -> Type:      {repo_type}")
-            
-            from huggingface_hub import hf_hub_download
-            
-            # Download file
-            downloaded_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                repo_type=repo_type,
-                token=hf_token,
-                local_dir=os.path.dirname(dataset_path),
-                local_dir_use_symlinks=False
-            )
-            
-            # Rename if the returned filename does not match dataset_path exactly
-            if downloaded_path != dataset_path and os.path.exists(downloaded_path):
-                os.replace(downloaded_path, dataset_path)
-            
-            print(f"Download Complete: Saved to '{dataset_path}' [OK]")
-            return
-        except Exception as e:
-            print(f"Warning: Hugging Face SDK download failed: {e}. Falling back to wget...")
-            
-    # Fallback to standard wget
+    # Execute streaming wget download with progress logging
     try:
-        cmd = ["wget", "-O", dataset_path, dataset_url]
-        if hf_token:
-            cmd.insert(1, f"--header=Authorization: Bearer {hf_token}")
-        subprocess.run(cmd, check=True)
+        subprocess.run(["wget", "-O", dataset_path, dataset_url], check=True)
         print(f"Download Complete: Saved dataset to '{dataset_path}' [OK]")
     except Exception as e:
         print(f"ERROR: Failed to download dataset using wget: {e}", file=sys.stderr)
@@ -244,7 +187,7 @@ def main():
     device, batch_size, max_sequence_length = configure_hardware_limits(args)
     
     # 2. Automated data downloader
-    handle_data_download(args.dataset_path, args.dataset_url, args.hf_token)
+    handle_data_download(args.dataset_path, args.dataset_url)
     
     # 3. Initialize model and dataloader
     print(f"\nInitializing DataLoader for PCAP at: '{args.dataset_path}'...")
