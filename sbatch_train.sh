@@ -37,6 +37,10 @@ handle_terminate() {
 # Example: module load cuda/12.1 anaconda3
 # Feel free to adjust these module loads for the specific AI Kosh node layout
 
+# Read custom dataset path and epochs from arguments (fall back to defaults)
+DATASET_PATH=${1:-"./data/cic-ids2017/cic_ids.pcap"}
+EPOCHS=${2:-10}
+
 # Activate local virtual environment
 if [ -d ".venv" ]; then
     echo "Activating virtual environment..."
@@ -44,16 +48,16 @@ if [ -d ".venv" ]; then
 fi
 
 # 1. Pre-flight diagnostics check (gatekeeper)
-echo "Running system verification check..."
-python setup_and_verify.py --dataset_path ./data/cic-ids2017/cic_ids.pcap
+echo "Running system verification check on: $DATASET_PATH"
+python setup_and_verify.py --dataset_path "$DATASET_PATH"
 if [ $? -ne 0 ]; then
     echo "Verification check failed. Aborting training job."
     exit 1
 fi
 
 # 2. Start training run in background so bash can trap signals
-echo "Launching training orchestrator..."
-python run_training.py --dataset_path ./data/cic-ids2017/cic_ids.pcap --epochs 10 &
+echo "Launching training orchestrator on $DATASET_PATH for $EPOCHS epochs..."
+python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss True --focal_gamma 2.0 &
 PYTHON_PID=$!
 
 # Wait for the python job to finish
