@@ -24,7 +24,9 @@ class CausalSelfAttention(nn.Module):
         
         # Project and split into Query, Key, Value
         qkv = self.qkv_proj(x)  # Shape: (B, T, 3 * C)
-        q, k, v = qkv.chunk(3, dim=-1)
+        q = qkv[:, :, :C]
+        k = qkv[:, :, C:2*C]
+        v = qkv[:, :, 2*C:]
         
         # Reshape to (B, nhead, T, head_dim)
         q = q.view(B, T, self.nhead, self.head_dim).transpose(1, 2)

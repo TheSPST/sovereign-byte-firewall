@@ -80,7 +80,7 @@ def main():
             dummy_input,
             args.output_onnx,
             export_params=True,
-            opset_version=17,  # Opset 17 fully supports scaled_dot_product_attention natively
+            opset_version=17,  # Opset 17 supports LayerNormalization natively
             do_constant_folding=True,
             input_names=['input_bytes'],
             output_names=['predicted_logits'],
