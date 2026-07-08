@@ -113,7 +113,10 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     
     if use_focal_loss:
         from src.losses import FocalLoss
-        criterion = FocalLoss(gamma=focal_gamma, ignore_index=-100)
+        # FIX W5: ignore_index=-1 matches the sentinel written by the dataloader for
+        # trailing-window padding (torch.full(..., -1)). This ensures padded positions
+        # are excluded from every gradient update across the entire training run.
+        criterion = FocalLoss(gamma=focal_gamma, ignore_index=-1)
     else:
         criterion = nn.CrossEntropyLoss()
     

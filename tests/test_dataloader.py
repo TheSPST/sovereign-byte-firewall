@@ -38,7 +38,7 @@ def test_dataloader():
         assert isinstance(batch, torch.Tensor), "Batch is not a PyTorch Tensor"
         assert batch.dim() == 2, f"Expected 2D tensor, got {batch.dim()}D"
         assert batch.size(1) == max_sequence_length, f"Expected sequence length {max_sequence_length}, got {batch.size(1)}"
-        assert (batch >= 0).all() and (batch <= 255).all(), "Byte values out of range (0-255)"
+        assert (batch >= -1).all() and (batch <= 255).all(), "Byte values out of range (-1 to 255)"
         
         if i == 0:
             print(f"Batch {i+1} shape: {list(batch.shape)}")

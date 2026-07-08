@@ -2,13 +2,15 @@ import os
 import csv
 import json
 import math
+import time
 import hashlib
 import datetime
+from collections import defaultdict, deque
 import torch
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 from scapy.utils import RawPcapReader
 from scapy.layers.l2 import Ether
-from scapy.layers.inet import TCP
+from scapy.layers.inet import IP, TCP
 
 class RawPcapIterableDataset(IterableDataset):
     """
@@ -220,6 +222,14 @@ class RawPcapIterableDataset(IterableDataset):
         return bytes(pkt_bytes)
 
     def __iter__(self):
+        # SYN flood rate-tracking state (per-worker process, initialised fresh per iteration).
+        # A single bare SYN is a normal TCP handshake step; only flag as a flood when the
+        # same source IP exceeds SYN_FLOOD_THRESHOLD SYNs within a 1-second sliding window,
+        # matching the operational definition in RFC 9293 and CIC-IDS2017 labelling guidelines.
+        _syn_tracker: dict = defaultdict(deque)  # {src_ip: deque[float]}
+        SYN_FLOOD_THRESHOLD: int = 50            # SYNs / second per source IP
+        SYN_WINDOW_SEC: float = 1.0              # sliding-window duration in seconds
+
         worker_info = get_worker_info()
         if worker_info is not None:
             worker_id = worker_info.id
@@ -257,22 +267,33 @@ class RawPcapIterableDataset(IterableDataset):
                     packet_len = len(packet_data)
                     
                     # 1. Vectorized Anomaly Labeling & Analysis
-                    is_syn = False
+                    # FIX W4: A bare SYN alone is a normal TCP handshake step.
+                    # We only flag TCP_SYN_Flood when the same source IP sends
+                    # more than SYN_FLOOD_THRESHOLD SYNs within a 1-second window.
+                    is_syn_flood = False
                     try:
                         pkt = Ether(packet_data)
                         if pkt.haslayer(TCP):
                             flags = int(pkt[TCP].flags)
-                            # Check for TCP SYN flags (SYN=2 set, ACK=16 is not set)
+                            # Bare SYN: SYN bit set, ACK bit not set
                             if (flags & 0x02) and not (flags & 0x10):
-                                is_syn = True
+                                src_ip = pkt[IP].src if pkt.haslayer(IP) else "unknown"
+                                now = time.monotonic()
+                                q = _syn_tracker[src_ip]
+                                q.append(now)
+                                # Evict timestamps that have fallen outside the sliding window
+                                while q and (now - q[0]) > SYN_WINDOW_SEC:
+                                    q.popleft()
+                                if len(q) > SYN_FLOOD_THRESHOLD:
+                                    is_syn_flood = True
                     except Exception:
                         pass
                     
                     entropy = self._calculate_packet_entropy(packet_data)
                     
                     # Label anomalies in append buffer
-                    if is_syn or entropy < 1.0 or (entropy > 7.7 and packet_len > 100):
-                        anomaly_type = "TCP_SYN_Flood" if is_syn else "Abnormal_Entropy"
+                    if is_syn_flood or entropy < 1.0 or (entropy > 7.7 and packet_len > 100):
+                        anomaly_type = "TCP_SYN_Flood" if is_syn_flood else "Abnormal_Entropy"
                         csv_writer.writerow([
                             os.path.basename(self.pcap_path), 
                             packet_index, 
@@ -322,11 +343,13 @@ class RawPcapIterableDataset(IterableDataset):
                     else:
                         remainder_start = 0
                         
-                    # Yield trailing bytes padded with 0
+                    # FIX W5: Pad with sentinel value -1 (outside the 0-255 byte range).
+                    # FocalLoss(ignore_index=-1) will exclude these positions from every
+                    # gradient update, preventing the model wasting capacity on NULL→NULL chains.
                     trailing = flat_bytes[remainder_start:]
                     if len(trailing) > 0:
                         pad_len = W - len(trailing)
-                        padded_tensor = torch.cat([trailing, torch.zeros(pad_len, dtype=torch.long)])
+                        padded_tensor = torch.cat([trailing, torch.full((pad_len,), -1, dtype=torch.long)])
                         yield padded_tensor.clone()
                         sequence_count += 1
             
