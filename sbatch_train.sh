@@ -47,6 +47,19 @@ if [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
 
+# Auto-extract if dataset is gzip compressed
+if [[ "$DATASET_PATH" == *.gz ]]; then
+    echo "Compressed dataset detected: $DATASET_PATH"
+    EXTRACTED_PCAP="${DATASET_PATH%.gz}"
+    if [ ! -f "$EXTRACTED_PCAP" ]; then
+        echo "Extracting dataset to $EXTRACTED_PCAP..."
+        gunzip -c "$DATASET_PATH" > "$EXTRACTED_PCAP"
+    else
+        echo "Extracted dataset already present at $EXTRACTED_PCAP. Skipping decompression."
+    fi
+    DATASET_PATH="$EXTRACTED_PCAP"
+fi
+
 # 1. Pre-flight diagnostics check (gatekeeper)
 echo "Running system verification check on: $DATASET_PATH"
 python setup_and_verify.py --dataset_path "$DATASET_PATH"
