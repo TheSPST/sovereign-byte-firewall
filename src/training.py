@@ -110,7 +110,18 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     if os.path.exists(checkpoint_path):
         print(f"Found active checkpoint at {checkpoint_path}. Resuming training...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state'])
+        
+        state_dict = checkpoint['model_state']
+        # Dynamically adjust for DataParallel module. prefix mismatch
+        is_dp = isinstance(model, torch.nn.DataParallel)
+        has_prefix = any(k.startswith('module.') for k in state_dict.keys())
+        
+        if not is_dp and has_prefix:
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        elif is_dp and not has_prefix:
+            state_dict = {'module.' + k: v for k, v in state_dict.items()}
+            
+        model.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_epoch = checkpoint['epoch']
         if scaler is not None and 'scaler_state' in checkpoint:
@@ -175,9 +186,12 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 "epoch": epoch + 1
             }
             
+            # Unpack model state dict cleanly to remove DataParallel prefix
+            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            
             checkpoint_state = {
                 'epoch': epoch + 1,
-                'model_state': model.state_dict(),
+                'model_state': model_state,
                 'optimizer_state': optimizer.state_dict(),
                 'metadata': checkpoint_metadata
             }
@@ -194,9 +208,12 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
             "dataset_hash": dataset_hash,
             "epoch": start_epoch  # current epoch state
         }
+        # Unpack model state dict cleanly to remove DataParallel prefix
+        model_state_interrupted = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+        
         checkpoint_state = {
             'epoch': start_epoch,
-            'model_state': model.state_dict(),
+            'model_state': model_state_interrupted,
             'optimizer_state': optimizer.state_dict(),
             'metadata': checkpoint_metadata
         }

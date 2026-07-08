@@ -21,3 +21,4 @@ checkpoints/
 data/
 *.pcap
 *.zip
+logs/
