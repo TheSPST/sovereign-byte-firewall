@@ -29,7 +29,7 @@ class FocalLoss(nn.Module):
             targets = targets[valid_mask]
             
             if inputs.numel() == 0:
-                return torch.tensor(0.0, device=inputs.device, requires_grad=True)
+                return inputs.sum() * 0.0
 
         log_pt = F.log_softmax(inputs, dim=-1)
         pt = torch.exp(log_pt)
