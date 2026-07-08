@@ -20,3 +20,4 @@ Thumbs.db
 checkpoints/
 data/
 *.pcap
+*.zip
