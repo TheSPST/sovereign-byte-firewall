@@ -22,6 +22,16 @@ from src.dataloader import get_pcap_dataloader
 from src.model import NetworkBytePatcher
 from src.training import train_patcher_on_kosh
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 def parse_args():
     # 1. Detect if running inside Kaggle environment
     is_kaggle = os.path.exists("/kaggle")
@@ -77,6 +87,18 @@ def parse_args():
         action="store_true",
         default=False,
         help="Bypass the CUDA GPU requirement (used for local CPU/MPS debugging)"
+    )
+    parser.add_argument(
+        "--use_focal_loss",
+        type=str2bool,
+        default=True,
+        help="Use Focal Loss instead of standard Cross Entropy (default: True)"
+    )
+    parser.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=2.0,
+        help="Focusing parameter gamma for Focal Loss (default: 2.0)"
     )
     return parser.parse_args()
 
@@ -220,7 +242,9 @@ def main():
         dataloader=dataloader,
         epochs=args.epochs,
         checkpoint_dir=args.checkpoints_dir,
-        lr=args.lr
+        lr=args.lr,
+        use_focal_loss=args.use_focal_loss,
+        focal_gamma=args.focal_gamma
     )
     print("\nKaggle training script finished successfully!")
 

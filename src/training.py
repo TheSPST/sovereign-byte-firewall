@@ -88,7 +88,7 @@ def log_telemetry_atomic(step, epoch):
         json.dump(existing_metrics, f, indent=4)
     os.replace(temp_path, metrics_path)
 
-def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4):
+def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0):
     """
     Resilient training loop designed for the AI Kosh cluster (SLURM).
     Handles automatic checkpoint saving, restoration, PyTorch 2.x AMP mixed precision,
@@ -98,7 +98,12 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     device = next(model.parameters()).device
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    
+    if use_focal_loss:
+        from src.losses import FocalLoss
+        criterion = FocalLoss(gamma=focal_gamma, ignore_index=-100)
+    else:
+        criterion = nn.CrossEntropyLoss()
     
     # Initialize GradScaler strictly only for CUDA execution
     scaler = torch.amp.GradScaler(device='cuda') if device.type == 'cuda' else None
@@ -156,7 +161,10 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                     
                 with autocast_ctx:
                     logits = model(inputs)
-                    loss = criterion(logits.reshape(-1, 256), targets.reshape(-1))
+                    if use_focal_loss:
+                        loss = criterion(logits, targets)
+                    else:
+                        loss = criterion(logits.reshape(-1, 256), targets.reshape(-1))
                 
                 # Backward pass and step using GradScaler for CUDA, or standard backward for CPU/MPS
                 if scaler is not None:
