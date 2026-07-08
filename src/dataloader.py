@@ -108,21 +108,102 @@ class RawPcapIterableDataset(IterableDataset):
 
     def _mask_packet_addresses(self, packet_data):
         """
-        Dynamically masks IP and MAC addresses in raw packet bytes
-        to prevent the model from memorizing specific host profiles.
+        Dynamically masks IP, MAC, TCP Options, and Encrypted TLS Application Data
+        in raw packet bytes using a dynamic protocol parser. Supports VLAN, QinQ,
+        MPLS, IPv4, IPv6, ARP, and TCP/TLS.
         """
         pkt_bytes = bytearray(packet_data)
+        n = len(pkt_bytes)
         
-        # 1. Mask MAC Addresses: First 12 bytes of Ethernet header
-        if len(pkt_bytes) >= 12:
+        # 1. Layer 2 Blanking (Static MACs)
+        if n >= 12:
             pkt_bytes[0:12] = b'\x00' * 12
             
-        # 2. Mask IPv4 source/destination IP addresses (offsets 26 to 33)
-        if len(pkt_bytes) >= 34:
-            is_ipv4 = (pkt_bytes[12] == 0x08 and pkt_bytes[13] == 0x00)
-            if is_ipv4:
-                pkt_bytes[26:34] = b'\x00' * 8
+        # 2. Dynamic Layer 3 Offset Calculation (supporting VLAN, QinQ, MPLS)
+        if n < 14:
+            return bytes(pkt_bytes)
+            
+        offset = 12
+        ethertype = (pkt_bytes[offset] << 8) | pkt_bytes[offset + 1]
+        offset += 2
+        
+        # Loop to handle stacked VLAN tags (QinQ: 0x8100, 0x88a8, 0x9100, 0x9200)
+        while ethertype in (0x8100, 0x88a8, 0x9100, 0x9200):
+            if n < offset + 4:
+                return bytes(pkt_bytes)
+            ethertype = (pkt_bytes[offset + 2] << 8) | pkt_bytes[offset + 3]
+            offset += 4
+            
+        l3_offset = offset
+        resolved_ethertype = ethertype
+        
+        # Handle MPLS Unicast/Multicast (0x8847 / 0x8848)
+        if resolved_ethertype in (0x8847, 0x8848):
+            while True:
+                if n < l3_offset + 4:
+                    return bytes(pkt_bytes)
+                bos = pkt_bytes[l3_offset + 2] & 0x01
+                l3_offset += 4
+                if bos:
+                    break
+            if n < l3_offset + 1:
+                return bytes(pkt_bytes)
+            version = (pkt_bytes[l3_offset] >> 4) & 0x0F
+            if version == 4:
+                resolved_ethertype = 0x0800
+            elif version == 6:
+                resolved_ethertype = 0x86DD
+            else:
+                resolved_ethertype = None
                 
+        # 3. Protocol-Specific L3 Address Masking
+        l4_offset = None
+        is_tcp = False
+        
+        if resolved_ethertype == 0x0800:  # IPv4
+            if n >= l3_offset + 20:
+                pkt_bytes[l3_offset + 12 : l3_offset + 20] = b'\x00' * 8
+                
+                protocol = pkt_bytes[l3_offset + 9]
+                if protocol == 6:  # TCP
+                    ihl = pkt_bytes[l3_offset] & 0x0F
+                    l4_offset = l3_offset + (ihl * 4)
+                    is_tcp = True
+                    
+        elif resolved_ethertype == 0x86DD:  # IPv6
+            if n >= l3_offset + 40:
+                pkt_bytes[l3_offset + 8 : l3_offset + 40] = b'\x00' * 32
+                
+                next_header = pkt_bytes[l3_offset + 6]
+                if next_header == 6:  # TCP
+                    l4_offset = l3_offset + 40
+                    is_tcp = True
+                    
+        elif resolved_ethertype == 0x0806:  # ARP
+            if n >= l3_offset + 28:
+                pkt_bytes[l3_offset + 8 : l3_offset + 28] = b'\x00' * 20
+                
+        # 4. Layer 4 (TCP) & Layer 7 (TLS) Masking
+        if is_tcp and l4_offset is not None:
+            if n >= l4_offset + 20:
+                tcp_data_offset = (pkt_bytes[l4_offset + 12] >> 4) & 0x0F
+                tcp_header_len = tcp_data_offset * 4
+                
+                # Mask variable TCP options (if TCP options are present, i.e., header len > 20)
+                if tcp_header_len > 20 and n >= l4_offset + tcp_header_len:
+                    pkt_bytes[l4_offset + 20 : l4_offset + tcp_header_len] = b'\x00' * (tcp_header_len - 20)
+                    
+                # Mask Encrypted TLS Payloads
+                sport = (pkt_bytes[l4_offset] << 8) | pkt_bytes[l4_offset + 1]
+                dport = (pkt_bytes[l4_offset + 2] << 8) | pkt_bytes[l4_offset + 3]
+                if sport == 443 or dport == 443:
+                    tls_offset = l4_offset + tcp_header_len
+                    if n >= tls_offset + 5:
+                        tls_content_type = pkt_bytes[tls_offset]
+                        # 0x17 represents Application Data (Encrypted Payload)
+                        if tls_content_type == 0x17:
+                            pkt_bytes[tls_offset + 5 : n] = b'\x00' * (n - (tls_offset + 5))
+                            
         return bytes(pkt_bytes)
 
     def __iter__(self):
