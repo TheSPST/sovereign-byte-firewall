@@ -22,12 +22,13 @@ class RawPcapIterableDataset(IterableDataset):
       3. Strict Trailing Remainder bounds calculation to prevent out-of-bounds.
       4. Tensor cloning on yield to prevent OOM memory pointer leaks of large file chunks.
     """
-    def __init__(self, pcap_path, max_sequence_length=8192, stride=None):
+    def __init__(self, pcap_path, max_sequence_length=8192, stride=None, mask_addresses=True):
         super().__init__()
         self.pcap_path = pcap_path
         self.max_sequence_length = max_sequence_length
         # Default stride to max_sequence_length (non-overlapping) if not specified
         self.stride = stride if stride is not None else max_sequence_length
+        self.mask_addresses = mask_addresses
         self.file_hash = None
         self.cached_sequences = None
         
@@ -105,6 +106,25 @@ class RawPcapIterableDataset(IterableDataset):
         entropy = -torch.sum(probs * torch.log2(probs + 1e-9))
         return entropy.item()
 
+    def _mask_packet_addresses(self, packet_data):
+        """
+        Dynamically masks IP and MAC addresses in raw packet bytes
+        to prevent the model from memorizing specific host profiles.
+        """
+        pkt_bytes = bytearray(packet_data)
+        
+        # 1. Mask MAC Addresses: First 12 bytes of Ethernet header
+        if len(pkt_bytes) >= 12:
+            pkt_bytes[0:12] = b'\x00' * 12
+            
+        # 2. Mask IPv4 source/destination IP addresses (offsets 26 to 33)
+        if len(pkt_bytes) >= 34:
+            is_ipv4 = (pkt_bytes[12] == 0x08 and pkt_bytes[13] == 0x00)
+            if is_ipv4:
+                pkt_bytes[26:34] = b'\x00' * 8
+                
+        return bytes(pkt_bytes)
+
     def __iter__(self):
         worker_info = get_worker_info()
         if worker_info is not None:
@@ -169,7 +189,8 @@ class RawPcapIterableDataset(IterableDataset):
 
                     # 2. Accumulate packet bytes for partitioned worker
                     if packet_index % num_workers == worker_id:
-                        buffer.extend(packet_data)
+                        data_to_append = self._mask_packet_addresses(packet_data) if self.mask_addresses else packet_data
+                        buffer.extend(data_to_append)
                         
                         # Process buffer if it exceeds the limit
                         if len(buffer) >= buffer_limit:
@@ -222,9 +243,14 @@ class RawPcapIterableDataset(IterableDataset):
         finally:
             csv_file.close()
 
-def get_pcap_dataloader(pcap_path, batch_size=32, num_workers=0, max_sequence_length=8192, stride=None):
+def get_pcap_dataloader(pcap_path, batch_size=32, num_workers=0, max_sequence_length=8192, stride=None, mask_addresses=True):
     """
     Factory function to create a PyTorch DataLoader for the PCAP streaming dataset.
     """
-    dataset = RawPcapIterableDataset(pcap_path, max_sequence_length=max_sequence_length, stride=stride)
+    dataset = RawPcapIterableDataset(
+        pcap_path, 
+        max_sequence_length=max_sequence_length, 
+        stride=stride, 
+        mask_addresses=mask_addresses
+    )
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
