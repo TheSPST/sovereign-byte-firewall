@@ -67,8 +67,8 @@ def parse_args():
     parser.add_argument(
         "--max_sequence_length",
         type=int,
-        default=8192,
-        help="Target sequence length (default: 8192)"
+        default=512,
+        help="Target sequence length (default: 512)"
     )
     parser.add_argument(
         "--lr",

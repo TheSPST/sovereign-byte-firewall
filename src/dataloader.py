@@ -39,6 +39,19 @@ class RawPcapIterableDataset(IterableDataset):
         # Load manifest cache or compute hash streaming-wise
         self._load_or_compute_hash()
 
+    def __len__(self):
+        if self.cached_sequences is not None:
+            return self.cached_sequences
+        # Fallback estimate based on file size and stride
+        try:
+            file_size = os.path.getsize(self.pcap_path)
+            # Assuming average packet payload content is ~85% of PCAP size
+            estimated_bytes = int(file_size * 0.85)
+            estimated_sequences = max(1, estimated_bytes // self.stride)
+            return estimated_sequences
+        except Exception:
+            return 1000  # Safe default fallback
+
     def _load_or_compute_hash(self):
         filename = os.path.basename(self.pcap_path)
         manifest_dir = "./data/manifests"

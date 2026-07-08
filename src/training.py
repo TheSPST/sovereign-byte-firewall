@@ -99,14 +99,26 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     
+    # Calculate total steps for OneCycleLR scheduler
+    total_steps = epochs * len(dataloader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=5e-4,
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy='cos',
+        div_factor=25.0,
+        final_div_factor=10000.0
+    )
+    
     if use_focal_loss:
         from src.losses import FocalLoss
         criterion = FocalLoss(gamma=focal_gamma, ignore_index=-100)
     else:
         criterion = nn.CrossEntropyLoss()
     
-    # Initialize GradScaler strictly only for CUDA execution
-    scaler = torch.amp.GradScaler(device='cuda') if device.type == 'cuda' else None
+    # Disable GradScaler for bfloat16 training (safest A100 pipeline)
+    scaler = None
     
     start_epoch = 0
     checkpoint_path = os.path.join(checkpoint_dir, "latest_patcher.pt")
@@ -126,8 +138,50 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
         elif is_dp and not has_prefix:
             state_dict = {'module.' + k: v for k, v in state_dict.items()}
             
+        # Dynamically handle size mismatches for pos_embedding.weight (e.g. 2048 -> 512)
+        pos_key = 'module.pos_embedding.weight' if (is_dp or has_prefix) else 'pos_embedding.weight'
+        if pos_key in state_dict:
+            checkpoint_pos_weight = state_dict[pos_key]
+            model_pos_embedding = model.module.pos_embedding if isinstance(model, torch.nn.DataParallel) else model.pos_embedding
+            target_pos_shape = model_pos_embedding.weight.shape
+            if checkpoint_pos_weight.shape != target_pos_shape:
+                print(f"Adapting pos_embedding.weight shape from {checkpoint_pos_weight.shape} to {target_pos_shape}...")
+                new_weight = model_pos_embedding.weight.clone().detach()
+                min_len = min(checkpoint_pos_weight.shape[0], target_pos_shape[0])
+                new_weight[:min_len, :] = checkpoint_pos_weight[:min_len, :]
+                state_dict[pos_key] = new_weight
+
+        # Align optimizer state shapes with current model parameters to avoid size mismatch on resume
+        model_params = list(model.parameters())
+        param_ids = checkpoint['optimizer_state']['param_groups'][0]['params']
+        for idx, param_id in enumerate(param_ids):
+            if param_id in checkpoint['optimizer_state']['state']:
+                state_entry = checkpoint['optimizer_state']['state'][param_id]
+                target_shape = model_params[idx].shape
+                for state_key in ['exp_avg', 'exp_avg_sq']:
+                    if state_key in state_entry:
+                        old_tensor = state_entry[state_key]
+                        if old_tensor.shape != target_shape:
+                            print(f"Resizing optimizer state '{state_key}' for param {idx} from {old_tensor.shape} to {target_shape}...")
+                            new_tensor = torch.zeros(target_shape, dtype=old_tensor.dtype, device=old_tensor.device)
+                            min_dim0 = min(old_tensor.shape[0], target_shape[0])
+                            new_tensor[:min_dim0, :] = old_tensor[:min_dim0, :]
+                            state_entry[state_key] = new_tensor
+
+        # Preserve scheduler-related keys in optimizer param_groups to prevent KeyError: 'max_lr'
+        saved_keys = []
+        for group in optimizer.param_groups:
+            saved_keys.append({k: v for k, v in group.items() if k not in ['params']})
+
         model.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint['optimizer_state'])
+
+        # Restore preserved keys
+        for idx, group in enumerate(optimizer.param_groups):
+            for k, v in saved_keys[idx].items():
+                group[k] = v
+        if 'scheduler_state' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state'])
         start_epoch = checkpoint['epoch']
         if scaler is not None and 'scaler_state' in checkpoint:
             scaler.load_state_dict(checkpoint['scaler_state'])
@@ -174,6 +228,8 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 else:
                     loss.backward()
                     optimizer.step()
+                if scheduler.last_epoch < scheduler.total_steps:
+                    scheduler.step()
                     
                 epoch_loss += loss.item()
                 steps += 1
@@ -201,6 +257,7 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 'epoch': epoch + 1,
                 'model_state': model_state,
                 'optimizer_state': optimizer.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
                 'metadata': checkpoint_metadata
             }
             if scaler is not None:
@@ -223,6 +280,7 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
             'epoch': start_epoch,
             'model_state': model_state_interrupted,
             'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
             'metadata': checkpoint_metadata
         }
         if scaler is not None:

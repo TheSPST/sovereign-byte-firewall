@@ -59,8 +59,8 @@ def parse_args():
     parser.add_argument(
         "--max_sequence_length",
         type=int,
-        default=2048,
-        help="Maximum sequence length for the PCAP streaming dataloader (default: 2048)"
+        default=512,
+        help="Maximum sequence length for the PCAP streaming dataloader (default: 512)"
     )
     parser.add_argument(
         "--bypass_cuda_check",
