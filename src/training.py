@@ -8,6 +8,7 @@ import resource
 import torch
 import torch.nn as nn
 from contextlib import nullcontext
+from src.cloud_backup import push_checkpoint
 
 def get_gpu_metrics():
     """
@@ -266,6 +267,8 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                         _step_ckpt['scaler_state'] = scaler.state_dict()
                     torch.save(_step_ckpt, checkpoint_path)
                     print(f"[Step Checkpoint] global_step={global_step} | Epoch {epoch} local step {step} → {checkpoint_path}")
+                    push_checkpoint(checkpoint_path, epoch=epoch,
+                                    global_step=global_step, checkpoint_type="mid_epoch")
                     
             # Calculate and print epoch average loss
             avg_loss = epoch_loss / steps if steps > 0 else 0.0
@@ -294,6 +297,8 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 
             torch.save(checkpoint_state, checkpoint_path)
             print(f"Checkpoint successfully secured at {checkpoint_path} for Epoch {epoch + 1} with metadata hash: {dataset_hash}.")
+            push_checkpoint(checkpoint_path, epoch=epoch + 1,
+                            global_step=global_step, checkpoint_type="epoch")
             
     except (KeyboardInterrupt, SystemExit):
         # FIX: save `epoch` (the epoch currently being trained), NOT `start_epoch`
@@ -329,6 +334,8 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
         torch.save(checkpoint_state, checkpoint_path)
         print(f"Interrupt checkpoint saved → {checkpoint_path} "
               f"(epoch={_interrupted_epoch}, global_step={global_step}).")
+        push_checkpoint(checkpoint_path, epoch=_interrupted_epoch,
+                        global_step=global_step, checkpoint_type="interrupt")
         
     print("Training job complete!")
     return model

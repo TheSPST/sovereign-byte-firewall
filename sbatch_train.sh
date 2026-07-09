@@ -41,6 +41,18 @@ handle_terminate() {
 DATASET_PATH=${1:-"./data/cic-ids2017/cic_ids.pcap"}
 EPOCHS=${2:-10}
 
+# ─── Hugging Face Cloud Backup ────────────────────────────────────────────────
+# Set these two variables to automatically upload every checkpoint to your
+# private Hugging Face model repository at the end of each epoch.
+#
+# How to get your token:  https://huggingface.co/settings/tokens
+# → Create a token with "write" permission, then paste it below.
+#
+# Leave them blank ("") to disable cloud backup (training will still work).
+export HF_TOKEN="${HF_TOKEN:-}"                          # e.g. hf_xxxxxxxxxxxxxx
+export HF_REPO_ID="${HF_REPO_ID:-}"                     # e.g. TheSPST/sovereign-byte-firewall
+# ──────────────────────────────────────────────────────────────────────────────
+
 # Activate local virtual environment
 if [ -d ".venv" ]; then
     echo "Activating virtual environment..."
