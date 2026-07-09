@@ -5,7 +5,7 @@ from src.dataloader import get_pcap_dataloader
 def test_dataloader():
     import sys
     pcap_path = "local_test.pcap"
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and "pytest" not in sys.argv[0] and not sys.argv[1].endswith(".py"):
         pcap_path = sys.argv[1]
     elif not os.path.exists(pcap_path):
         pcap_path = "/Users/shubhamtomar/Desktop/local_test.pcap"

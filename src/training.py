@@ -88,7 +88,7 @@ def log_telemetry_atomic(step, epoch):
         json.dump(existing_metrics, f, indent=4)
     os.replace(temp_path, metrics_path)
 
-def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0):
+def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000):
     """
     Resilient training loop designed for the AI Kosh cluster (SLURM).
     Handles automatic checkpoint saving, restoration, PyTorch 2.x AMP mixed precision,
@@ -124,6 +124,7 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     scaler = None
     
     start_epoch = 0
+    global_step = 0  # total steps across all epochs; restored from checkpoint on resume
     checkpoint_path = os.path.join(checkpoint_dir, "latest_patcher.pt")
     
     # Auto-resume logic if pre-empted
@@ -186,9 +187,10 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
         if 'scheduler_state' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state'])
         start_epoch = checkpoint['epoch']
+        global_step = checkpoint.get('global_step', 0)  # restore total-step counter
         if scaler is not None and 'scaler_state' in checkpoint:
             scaler.load_state_dict(checkpoint['scaler_state'])
-        print(f"Resumed successfully from epoch {start_epoch}.")
+        print(f"Resumed successfully from epoch {start_epoch} (global_step={global_step}).")
     else:
         print("No active checkpoint found. Starting training from scratch.")
 
@@ -236,11 +238,34 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                     
                 epoch_loss += loss.item()
                 steps += 1
-                
+                global_step += 1
+
                 # Log telemetry metrics every 100 iterations
                 if step % 100 == 0:
                     log_telemetry_atomic(step, epoch)
-                    print(f"Epoch [{epoch}/{epochs}] | Step {step} | Loss: {loss.item():.4f}")
+                    print(f"Epoch [{epoch}/{epochs}] | Step {step} | Global {global_step} | Loss: {loss.item():.4f}")
+
+                # Mid-epoch step-interval checkpoint — protects against SLURM wall-time eviction.
+                # Saves 'epoch' (not epoch+1) so resume correctly restarts this epoch from step 0.
+                if global_step % checkpoint_interval_steps == 0:
+                    _step_model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+                    _step_ckpt = {
+                        'epoch': epoch,
+                        'global_step': global_step,
+                        'model_state': _step_model_state,
+                        'optimizer_state': optimizer.state_dict(),
+                        'scheduler_state': scheduler.state_dict(),
+                        'metadata': {
+                            'model_version': '1.0.0',
+                            'dataset_hash': dataset_hash,
+                            'checkpoint_type': 'mid_epoch_step',
+                            'local_step': step,
+                        }
+                    }
+                    if scaler is not None:
+                        _step_ckpt['scaler_state'] = scaler.state_dict()
+                    torch.save(_step_ckpt, checkpoint_path)
+                    print(f"[Step Checkpoint] global_step={global_step} | Epoch {epoch} local step {step} → {checkpoint_path}")
                     
             # Calculate and print epoch average loss
             avg_loss = epoch_loss / steps if steps > 0 else 0.0
@@ -258,6 +283,7 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
             
             checkpoint_state = {
                 'epoch': epoch + 1,
+                'global_step': global_step,
                 'model_state': model_state,
                 'optimizer_state': optimizer.state_dict(),
                 'scheduler_state': scheduler.state_dict(),
@@ -270,17 +296,28 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
             print(f"Checkpoint successfully secured at {checkpoint_path} for Epoch {epoch + 1} with metadata hash: {dataset_hash}.")
             
     except (KeyboardInterrupt, SystemExit):
-        print("Training execution interrupted! Securing final checkpoint state before termination...")
+        # FIX: save `epoch` (the epoch currently being trained), NOT `start_epoch`
+        # (the epoch we resumed from, which may already be complete).
+        # Using locals().get() guards against the edge case where the signal
+        # arrives before the epoch loop variable is first assigned.
+        _interrupted_epoch = locals().get('epoch', start_epoch)
+        print(
+            f"Training interrupted at epoch={_interrupted_epoch}, global_step={global_step}. "
+            f"Securing checkpoint before termination..."
+        )
         checkpoint_metadata = {
             "model_version": "1.0.0",
             "dataset_hash": dataset_hash,
-            "epoch": start_epoch  # current epoch state
+            "epoch": _interrupted_epoch,
+            "checkpoint_type": "interrupt",
+            "global_step": global_step,
         }
         # Unpack model state dict cleanly to remove DataParallel prefix
         model_state_interrupted = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
-        
+
         checkpoint_state = {
-            'epoch': start_epoch,
+            'epoch': _interrupted_epoch,   # resume restarts this epoch from step 0
+            'global_step': global_step,
             'model_state': model_state_interrupted,
             'optimizer_state': optimizer.state_dict(),
             'scheduler_state': scheduler.state_dict(),
@@ -288,9 +325,10 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
         }
         if scaler is not None:
             checkpoint_state['scaler_state'] = scaler.state_dict()
-            
+
         torch.save(checkpoint_state, checkpoint_path)
-        print("Termination checkpoint saved successfully.")
+        print(f"Interrupt checkpoint saved → {checkpoint_path} "
+              f"(epoch={_interrupted_epoch}, global_step={global_step}).")
         
     print("Training job complete!")
     return model

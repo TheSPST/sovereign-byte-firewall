@@ -104,7 +104,10 @@ class NetworkBytePatcher(nn.Module):
         positions = torch.arange(T, device=x.device).unsqueeze(0)  # Shape: (1, T)
         
         # Embed bytes and add position information
-        x_emb = self.byte_embedding(x)  # Shape: (B, T, d_model)
+        # Clamp input values to >= 0 so that padding sentinels (-1) do not trigger out-of-range IndexErrors in the embedding lookup.
+        # Since target padded elements are ignored during loss computation (ignore_index=-1), this is safe.
+        x_clamped = torch.clamp(x, min=0)
+        x_emb = self.byte_embedding(x_clamped)  # Shape: (B, T, d_model)
         x_pos = self.pos_embedding(positions)  # Shape: (1, T, d_model)
         
         h = self.dropout(x_emb + x_pos)
