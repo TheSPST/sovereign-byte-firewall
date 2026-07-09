@@ -42,15 +42,39 @@ DATASET_PATH=${1:-"./data/cic-ids2017/cic_ids.pcap"}
 EPOCHS=${2:-10}
 
 # ─── Hugging Face Cloud Backup ────────────────────────────────────────────────
-# Set these two variables to automatically upload every checkpoint to your
-# private Hugging Face model repository at the end of each epoch.
+# Checkpoints are automatically pushed to your HF Hub repo after every epoch.
 #
-# How to get your token:  https://huggingface.co/settings/tokens
-# → Create a token with "write" permission, then paste it below.
+# SETUP (run these ONCE on every machine / cluster node, not inside this script):
 #
-# Leave them blank ("") to disable cloud backup (training will still work).
-export HF_TOKEN="${HF_TOKEN:-}"                          # e.g. hf_xxxxxxxxxxxxxx
-export HF_REPO_ID="${HF_REPO_ID:-}"                     # e.g. TheSPST/sovereign-byte-firewall
+#   Step 1 — Install the HF CLI:
+#     pip install "huggingface_hub>=0.25"
+#
+#   Step 2 — Login (saves token to ~/.cache/huggingface/token):
+#     hf auth login
+#     # Paste your token from: https://huggingface.co/settings/tokens
+#     # Choose "write" permission.
+#
+#   Step 3 — Set your repo (edit the line below OR export before sbatch):
+#     export HF_REPO_ID="TheSPST/sovereign-byte-firewall"
+#
+# Alternative — pass token directly via env var (for headless SLURM nodes):
+#   export HF_TOKEN="hf_xxxxxxxxxxxxxxxxxxxx"
+#   export HF_REPO_ID="TheSPST/sovereign-byte-firewall"
+#
+# Leave HF_REPO_ID blank to disable cloud backup entirely (training still runs).
+export HF_REPO_ID="${HF_REPO_ID:-}"        # ← SET THIS to your HF repo ID
+export HF_TOKEN="${HF_TOKEN:-}"             # optional — hf auth login is preferred
+
+# Pre-flight: warn if no auth method is found
+if [ -n "$HF_REPO_ID" ]; then
+    if [ -z "$HF_TOKEN" ] && [ ! -f "$HOME/.cache/huggingface/token" ]; then
+        echo "[CloudBackup] WARNING: HF_REPO_ID is set but no token found."
+        echo "[CloudBackup]   Run: hf auth login  OR  export HF_TOKEN=hf_..."
+        echo "[CloudBackup]   Uploads will be skipped unless a token is available."
+    else
+        echo "[CloudBackup] HF cloud backup enabled → ${HF_REPO_ID}"
+    fi
+fi
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Activate local virtual environment
