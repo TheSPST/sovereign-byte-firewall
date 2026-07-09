@@ -366,14 +366,33 @@ class RawPcapIterableDataset(IterableDataset):
             pcap_file_obj.close()
             csv_file.close()
 
-def get_pcap_dataloader(pcap_path, batch_size=32, num_workers=0, max_sequence_length=8192, stride=None, mask_addresses=True):
+def get_pcap_dataloader(pcap_path, batch_size=None, num_workers=None, max_sequence_length=8192, stride=None, mask_addresses=True):
     """
     Factory function to create a PyTorch DataLoader for the PCAP streaming dataset.
+    Auto-detects the hardware environment to optimize CPU workers and batch size.
     """
+    # Auto-Detector Logic
+    import os
+    is_kaggle = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+    
+    if batch_size is None:
+        batch_size = 64 if is_kaggle else 128
+        
+    if num_workers is None:
+        num_workers = 4 if is_kaggle else 8
+        
+    print(f"[ENV] Configured DataLoader -> Workers: {num_workers} | Batch Size: {batch_size}")
+
     dataset = RawPcapIterableDataset(
         pcap_path, 
         max_sequence_length=max_sequence_length, 
         stride=stride, 
         mask_addresses=mask_addresses
     )
-    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
+    
+    return DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        num_workers=num_workers,
+        pin_memory=True # Crucial for fast CPU-to-GPU memory transfers
+    )
