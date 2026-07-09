@@ -140,9 +140,81 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     checkpoint_path = os.path.join(checkpoint_dir, "latest_patcher.pt")
     dataset_hash = getattr(dataloader.dataset, "file_hash", "unknown")
     
-    # [Keep your existing Auto-resume logic here...]
-    # When loading/saving weights, remember to use accelerator.unwrap_model(model)
-    # instead of checking for isinstance(model, torch.nn.DataParallel)
+    # Auto-resume logic if pre-empted by SLURM
+    if os.path.exists(checkpoint_path):
+        print(f"Found active checkpoint. Resuming training...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # When restoring weights under Accelerate, we load into the unwrapped model
+        unwrapped_model = accelerator.unwrap_model(model)
+        state_dict = checkpoint['model_state']
+        
+        # Clean 'module.' prefix if present
+        has_prefix = any(k.startswith('module.') for k in state_dict.keys())
+        if has_prefix:
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            
+        # Dynamically handle size mismatches for pos_embedding.weight
+        pos_key = 'pos_embedding.weight'
+        if pos_key in state_dict:
+            checkpoint_pos_weight = state_dict[pos_key]
+            model_pos_embedding = getattr(unwrapped_model, 'pos_embedding', None)
+            if model_pos_embedding is not None:
+                target_pos_shape = model_pos_embedding.weight.shape
+                if checkpoint_pos_weight.shape != target_pos_shape:
+                    print(f"Adapting pos_embedding.weight shape from {checkpoint_pos_weight.shape} to {target_pos_shape}...")
+                    new_weight = model_pos_embedding.weight.clone().detach()
+                    min_len = min(checkpoint_pos_weight.shape[0], target_pos_shape[0])
+                    new_weight[:min_len, :] = checkpoint_pos_weight[:min_len, :]
+                    state_dict[pos_key] = new_weight
+
+        unwrapped_model.load_state_dict(state_dict)
+        
+        if 'optimizer_state' in checkpoint:
+            # Align optimizer state shapes with current model parameters
+            try:
+                model_params = list(unwrapped_model.parameters())
+                if 'param_groups' in checkpoint['optimizer_state']:
+                    param_ids = checkpoint['optimizer_state']['param_groups'][0]['params']
+                    for idx, param_id in enumerate(param_ids):
+                        if idx < len(model_params) and param_id in checkpoint['optimizer_state']['state']:
+                            state_entry = checkpoint['optimizer_state']['state'][param_id]
+                            target_shape = model_params[idx].shape
+                            for state_key in ['exp_avg', 'exp_avg_sq']:
+                                if state_key in state_entry:
+                                    old_tensor = state_entry[state_key]
+                                    if old_tensor.shape != target_shape:
+                                        print(f"Resizing optimizer state '{state_key}' for param {idx} from {old_tensor.shape} to {target_shape}...")
+                                        new_tensor = torch.zeros(target_shape, dtype=old_tensor.dtype, device=old_tensor.device)
+                                        min_dim0 = min(old_tensor.shape[0], target_shape[0])
+                                        new_tensor[:min_dim0, :] = old_tensor[:min_dim0, :]
+                                        state_entry[state_key] = new_tensor
+            except Exception as e:
+                print(f"Warning: could not adapt optimizer state shapes: {e}")
+            
+            # Preserve scheduler-related keys in optimizer param_groups to prevent KeyError: 'max_lr'
+            saved_keys = []
+            for group in optimizer.param_groups:
+                saved_keys.append({k: v for k, v in group.items() if k not in ['params']})
+                
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+            
+            for idx, group in enumerate(optimizer.param_groups):
+                for k, v in saved_keys[idx].items():
+                    group[k] = v
+                    
+        if 'scheduler_state' in checkpoint and scheduler is not None:
+            scheduler.load_state_dict(checkpoint['scheduler_state'])
+            
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch']
+            
+        if 'global_step' in checkpoint:
+            global_step = checkpoint['global_step']
+            
+        print(f"Successfully resumed from epoch {start_epoch}, step {global_step}")
+    else:
+        print("No active checkpoint found. Starting training from scratch.")
 
     model.train()
     
@@ -171,7 +243,9 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 accelerator.backward(loss)
                 optimizer.step()
                 
-                if scheduler.last_epoch < scheduler.total_steps:
+                # Unmask the native PyTorch scheduler to check its internal step counter
+                underlying_scheduler = getattr(scheduler, "scheduler", scheduler)
+                if underlying_scheduler.last_epoch < underlying_scheduler.total_steps:
                     scheduler.step()
                     
                 epoch_loss += loss.item()
@@ -195,6 +269,7 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                         'optimizer_state': optimizer.state_dict(),
                         'scheduler_state': scheduler.state_dict(),
                         'metadata': {
+                            'model_version': '1.0.0',
                             'dataset_hash': dataset_hash,
                             'checkpoint_type': 'mid_epoch_step'
                         }
@@ -216,7 +291,11 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                     'model_state': unwrapped_model.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
                     'scheduler_state': scheduler.state_dict(),
-                    'metadata': {"dataset_hash": dataset_hash, "epoch": epoch + 1}
+                    'metadata': {
+                        'model_version': '1.0.0',
+                        'dataset_hash': dataset_hash,
+                        'epoch': epoch + 1
+                    }
                 }
                 torch.save(checkpoint_state, checkpoint_path)
                 push_checkpoint(checkpoint_path, epoch=epoch + 1, global_step=global_step, checkpoint_type="epoch")
@@ -233,7 +312,12 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 'model_state': unwrapped_model.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
                 'scheduler_state': scheduler.state_dict(),
-                'metadata': {"epoch": _interrupted_epoch, "checkpoint_type": "interrupt"}
+                'metadata': {
+                    'model_version': '1.0.0',
+                    'dataset_hash': dataset_hash,
+                    'epoch': _interrupted_epoch,
+                    'checkpoint_type': 'interrupt'
+                }
             }
             torch.save(checkpoint_state, checkpoint_path)
             push_checkpoint(checkpoint_path, epoch=_interrupted_epoch, global_step=global_step, checkpoint_type="interrupt")

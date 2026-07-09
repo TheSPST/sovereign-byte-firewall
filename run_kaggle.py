@@ -228,11 +228,6 @@ def main():
         max_sequence_length=max_sequence_length
     )
     
-    # Wrap model in DataParallel if multiple GPUs are available
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for parallel training via torch.nn.DataParallel!")
-        model = torch.nn.DataParallel(model)
-        
     model = model.to(device)
     
     # 4. Initiate training
