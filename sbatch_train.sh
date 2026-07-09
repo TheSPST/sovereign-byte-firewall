@@ -62,7 +62,7 @@ EPOCHS=${2:-10}
 #   export HF_REPO_ID="TheSPST/sovereign-byte-firewall"
 #
 # Leave HF_REPO_ID blank to disable cloud backup entirely (training still runs).
-export HF_REPO_ID="${HF_REPO_ID:-}"        # ← SET THIS to your HF repo ID
+export HF_REPO_ID="${HF_REPO_ID:-spst01/sovereign-byte-firewall}"  # ← your HF repo
 export HF_TOKEN="${HF_TOKEN:-}"             # optional — hf auth login is preferred
 
 # Pre-flight: warn if no auth method is found
