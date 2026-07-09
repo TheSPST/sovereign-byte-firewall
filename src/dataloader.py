@@ -47,6 +47,9 @@ class RawPcapIterableDataset(IterableDataset):
         # Fallback estimate based on file size and stride
         try:
             file_size = os.path.getsize(self.pcap_path)
+            if self.pcap_path.endswith(".gz"):
+                # PCAPs typically compress to ~20% of their original size, so scale by 5.0
+                file_size = int(file_size * 5.0)
             # Assuming average packet payload content is ~85% of PCAP size
             estimated_bytes = int(file_size * 0.85)
             estimated_sequences = max(1, estimated_bytes // self.stride)
@@ -256,8 +259,10 @@ class RawPcapIterableDataset(IterableDataset):
         # 10MB streaming chunks buffer limit
         buffer_limit = 10 * 1024 * 1024 
 
+        import gzip
+        pcap_file_obj = gzip.open(self.pcap_path, "rb") if self.pcap_path.endswith(".gz") else open(self.pcap_path, "rb")
         try:
-            with RawPcapReader(self.pcap_path) as pcap_reader:
+            with RawPcapReader(pcap_file_obj) as pcap_reader:
                 buffer = []
                 packet_index = 0
                 sequence_count = 0
@@ -358,6 +363,7 @@ class RawPcapIterableDataset(IterableDataset):
                 self._write_manifest_atomic(sequence_count)
                 
         finally:
+            pcap_file_obj.close()
             csv_file.close()
 
 def get_pcap_dataloader(pcap_path, batch_size=32, num_workers=0, max_sequence_length=8192, stride=None, mask_addresses=True):
