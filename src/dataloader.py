@@ -3,6 +3,7 @@ import csv
 import json
 import math
 import time
+import random
 import hashlib
 import datetime
 from collections import defaultdict, deque
@@ -23,14 +24,21 @@ class RawPcapIterableDataset(IterableDataset):
       2. Vectorized Shannon Entropy via torch.bincount (no Python loop / Counter).
       3. Strict Trailing Remainder bounds calculation to prevent out-of-bounds.
       4. Tensor cloning on yield to prevent OOM memory pointer leaks of large file chunks.
+      5. Bounded shuffle buffer: since packets are streamed in strict file (chronological)
+         order, training on them unshuffled means gradient updates within any stretch of
+         steps are drawn from whatever narrow slice of the day the reader currently sits
+         in — a highly non-stationary signal. Windows are pooled into a fixed-size buffer,
+         shuffled, and emitted in randomized order to break that correlation while keeping
+         memory bounded (this is the standard streaming shuffle-buffer technique).
     """
-    def __init__(self, pcap_path, max_sequence_length=8192, stride=None, mask_addresses=True):
+    def __init__(self, pcap_path, max_sequence_length=8192, stride=None, mask_addresses=True, shuffle_buffer_windows=4096):
         super().__init__()
         self.pcap_path = pcap_path
         self.max_sequence_length = max_sequence_length
         # Default stride to max_sequence_length (non-overlapping) if not specified
         self.stride = stride if stride is not None else max_sequence_length
         self.mask_addresses = mask_addresses
+        self.shuffle_buffer_windows = shuffle_buffer_windows
         self.file_hash = None
         self.cached_sequences = None
         
@@ -261,6 +269,20 @@ class RawPcapIterableDataset(IterableDataset):
 
         import gzip
         pcap_file_obj = gzip.open(self.pcap_path, "rb") if self.pcap_path.endswith(".gz") else open(self.pcap_path, "rb")
+
+        # Bounded shuffle buffer (see class docstring point 5): windows are pooled here,
+        # shuffled, and flushed once full, instead of being yielded in raw file order.
+        shuffle_pool = []
+
+        def _emit(window_tensor):
+            """Queue a window for shuffled emission; flush the pool once it's full."""
+            shuffle_pool.append(window_tensor)
+            if len(shuffle_pool) >= self.shuffle_buffer_windows:
+                random.shuffle(shuffle_pool)
+                for w in shuffle_pool:
+                    yield w
+                shuffle_pool.clear()
+
         try:
             with RawPcapReader(pcap_file_obj) as pcap_reader:
                 buffer = []
@@ -323,9 +345,11 @@ class RawPcapIterableDataset(IterableDataset):
                                 limit_bytes = num_windows * S + (W - S)
                                 windows = torch.as_strided(flat_bytes[:limit_bytes], size=(num_windows, W), stride=(S, 1))
                                 for window in windows:
-                                    # Tensor cloning on yield to prevent OOM memory pointer leaks
-                                    yield window.clone()
-                                    sequence_count += 1
+                                    # Tensor cloning to prevent OOM memory pointer leaks; routed
+                                    # through the shuffle pool instead of yielding directly.
+                                    for emitted in _emit(window.clone()):
+                                        yield emitted
+                                        sequence_count += 1
                                 # Keep remainder
                                 buffer = buffer[num_windows * S:]
                                 
@@ -342,12 +366,13 @@ class RawPcapIterableDataset(IterableDataset):
                         limit_bytes = num_windows * S + (W - S)
                         windows = torch.as_strided(flat_bytes[:limit_bytes], size=(num_windows, W), stride=(S, 1))
                         for window in windows:
-                            yield window.clone()
-                            sequence_count += 1
+                            for emitted in _emit(window.clone()):
+                                yield emitted
+                                sequence_count += 1
                         remainder_start = num_windows * S
                     else:
                         remainder_start = 0
-                        
+
                     # FIX W5: Pad with sentinel value -1 (outside the 0-255 byte range).
                     # FocalLoss(ignore_index=-1) will exclude these positions from every
                     # gradient update, preventing the model wasting capacity on NULL→NULL chains.
@@ -355,9 +380,18 @@ class RawPcapIterableDataset(IterableDataset):
                     if len(trailing) > 0:
                         pad_len = W - len(trailing)
                         padded_tensor = torch.cat([trailing, torch.full((pad_len,), -1, dtype=torch.long)])
-                        yield padded_tensor.clone()
+                        for emitted in _emit(padded_tensor.clone()):
+                            yield emitted
+                            sequence_count += 1
+
+                # Final flush: emit whatever's left in the shuffle pool (guaranteed < buffer size)
+                if shuffle_pool:
+                    random.shuffle(shuffle_pool)
+                    for w in shuffle_pool:
+                        yield w
                         sequence_count += 1
-            
+                    shuffle_pool.clear()
+
             # Atomic Manifest update when loading finishes (only write for main process / worker 0)
             if worker_id == 0:
                 self._write_manifest_atomic(sequence_count)
@@ -366,28 +400,33 @@ class RawPcapIterableDataset(IterableDataset):
             pcap_file_obj.close()
             csv_file.close()
 
-def get_pcap_dataloader(pcap_path, batch_size=None, num_workers=None, max_sequence_length=8192, stride=None, mask_addresses=True):
+def get_pcap_dataloader(pcap_path, batch_size=None, num_workers=None, max_sequence_length=8192, stride=None, mask_addresses=True, shuffle_buffer_windows=4096):
     """
     Factory function to create a PyTorch DataLoader for the PCAP streaming dataset.
     Auto-detects the hardware environment to optimize CPU workers and batch size.
+
+    shuffle_buffer_windows: size of the bounded shuffle pool windows are drawn from before
+    being emitted (see RawPcapIterableDataset docstring). Larger = better shuffling, more
+    RAM. Set to 1 to disable shuffling entirely (strict file order, previous behavior).
     """
     # Auto-Detector Logic
     import os
     is_kaggle = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
-    
+
     if batch_size is None:
         batch_size = 64 if is_kaggle else 128
-        
+
     if num_workers is None:
         num_workers = 4 if is_kaggle else 8
-        
-    print(f"[ENV] Configured DataLoader -> Workers: {num_workers} | Batch Size: {batch_size}")
+
+    print(f"[ENV] Configured DataLoader -> Workers: {num_workers} | Batch Size: {batch_size} | Shuffle Buffer: {shuffle_buffer_windows} windows")
 
     dataset = RawPcapIterableDataset(
-        pcap_path, 
-        max_sequence_length=max_sequence_length, 
-        stride=stride, 
-        mask_addresses=mask_addresses
+        pcap_path,
+        max_sequence_length=max_sequence_length,
+        stride=stride,
+        mask_addresses=mask_addresses,
+        shuffle_buffer_windows=shuffle_buffer_windows
     )
     
     return DataLoader(
