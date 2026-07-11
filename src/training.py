@@ -91,10 +91,43 @@ def log_telemetry_atomic(step, epoch):
 
 from accelerate import Accelerator
 
-def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000):
+@torch.no_grad()
+def evaluate_validation_loss(model, val_dataloader, criterion, use_focal_loss, accelerator):
+    """
+    Runs a no-grad pass over a held-out validation dataloader and returns the
+    mean loss. This is the ONLY signal that tells you whether the model is
+    generalizing to unseen benign traffic or just memorizing the training file —
+    training loss alone cannot tell you that.
+    """
+    model.eval()
+    total_loss = 0.0
+    steps = 0
+    for byte_sequence in val_dataloader:
+        inputs = byte_sequence[:, :-1]
+        targets = byte_sequence[:, 1:]
+        logits = model(inputs)
+        if use_focal_loss:
+            loss = criterion(logits, targets)
+        else:
+            loss = criterion(logits.reshape(-1, 256), targets.reshape(-1))
+        total_loss += loss.item()
+        steps += 1
+    model.train()
+    if steps == 0:
+        return None
+    return total_loss / steps
+
+
+def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000, val_dataloader=None):
     """
     Unified training loop for Kaggle (T4/P100) and AI Kosh (A100).
     Powered by Hugging Face Accelerate for maximum multi-GPU throughput.
+
+    val_dataloader (optional): a SEPARATE dataloader over benign traffic that is
+    NEVER trained on. If provided, validation loss is computed at the end of
+    every epoch and stored in the checkpoint's metadata as 'val_loss'. Use a
+    genuinely disjoint file/time-range from the training set, or this number
+    is meaningless.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -134,6 +167,12 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
     )
+
+    if val_dataloader is not None:
+        val_dataloader = accelerator.prepare(val_dataloader)
+        print(f"[VALIDATION] Held-out validation dataloader active (file_hash="
+              f"{getattr(val_dataloader.dataset, 'file_hash', 'unknown')}). "
+              f"Validation loss will be computed after every epoch.")
     
     start_epoch = 0
     global_step = 0 
@@ -280,11 +319,19 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                     
             if accelerator.is_main_process:
                 avg_loss = epoch_loss / steps if steps > 0 else 0.0
-                print(f"Epoch [{epoch}/{epochs}] Complete | Average Loss: {avg_loss:.4f}")
-                
+                print(f"Epoch [{epoch}/{epochs}] Complete | Average Training Loss: {avg_loss:.4f}")
+
+                val_loss = None
+                if val_dataloader is not None:
+                    val_loss = evaluate_validation_loss(model, val_dataloader, criterion, use_focal_loss, accelerator)
+                    if val_loss is not None:
+                        gap = val_loss - avg_loss
+                        print(f"Epoch [{epoch}/{epochs}] Complete | Validation Loss: {val_loss:.4f} "
+                              f"(train/val gap: {gap:+.4f}{' — WATCH FOR OVERFITTING' if gap > 0.5 else ''})")
+
                 # Unwrap model for epoch save
                 unwrapped_model = accelerator.unwrap_model(model)
-                
+
                 checkpoint_state = {
                     'epoch': epoch + 1,
                     'global_step': global_step,
@@ -294,7 +341,10 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                     'metadata': {
                         'model_version': '1.0.0',
                         'dataset_hash': dataset_hash,
-                        'epoch': epoch + 1
+                        'val_dataset_hash': getattr(val_dataloader.dataset, 'file_hash', None) if val_dataloader is not None else None,
+                        'epoch': epoch + 1,
+                        'train_loss': avg_loss,
+                        'val_loss': val_loss,
                     }
                 }
                 torch.save(checkpoint_state, checkpoint_path)

@@ -63,6 +63,13 @@ def parse_args():
         help="Maximum sequence length for the PCAP streaming dataloader (default: 512)"
     )
     parser.add_argument(
+        "--val_dataset_path",
+        type=str,
+        default=None,
+        help="Path to a SEPARATE held-out benign PCAP, never trained on, used to compute "
+             "validation loss after every epoch (default: None — no validation tracking)"
+    )
+    parser.add_argument(
         "--bypass_cuda_check",
         action="store_true",
         default=False,
@@ -144,7 +151,22 @@ def main():
     # Instantiates the model using default ultra-lightweight configuration
     # (num_layers=2, d_model=128, nhead=4) for <1ms inference footprint per packet chunk
     model = NetworkBytePatcher(d_model=128, nhead=4, num_layers=2).to(device)
-    
+
+    # Optional held-out validation dataloader (never trained on)
+    val_dataloader = None
+    if args.val_dataset_path:
+        if not os.path.exists(args.val_dataset_path):
+            print(f"WARNING: --val_dataset_path '{args.val_dataset_path}' not found. "
+                  f"Continuing without validation tracking.", file=sys.stderr)
+        else:
+            print(f"Loading VALIDATION PCAP dataset: '{args.val_dataset_path}'...")
+            val_dataloader = get_pcap_dataloader(
+                pcap_path=args.val_dataset_path,
+                batch_size=args.batch_size,
+                num_workers=0,
+                max_sequence_length=args.max_sequence_length
+            )
+
     print("\nStarting training orchestrator loop...")
     train_patcher_on_kosh(
         model=model,
@@ -153,7 +175,8 @@ def main():
         checkpoint_dir=checkpoint_dir,
         lr=args.lr,
         use_focal_loss=args.use_focal_loss,
-        focal_gamma=args.focal_gamma
+        focal_gamma=args.focal_gamma,
+        val_dataloader=val_dataloader
     )
     
     print("\nOrchestrated training job completed successfully!")

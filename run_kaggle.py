@@ -53,6 +53,13 @@ def parse_args():
         help="Hugging Face download URL for the PCAP dataset (if not locally present)"
     )
     parser.add_argument(
+        "--val_dataset_path",
+        type=str,
+        default=None,
+        help="Path to a SEPARATE held-out benign PCAP, never trained on, used to compute "
+             "validation loss after every epoch (default: None — no validation tracking)"
+    )
+    parser.add_argument(
         "--epochs",
         type=int,
         default=5,
@@ -222,14 +229,29 @@ def main():
     
     print("Initializing NetworkBytePatcher (ultra-lightweight configuration)...")
     model = NetworkBytePatcher(
-        d_model=128, 
-        nhead=4, 
-        num_layers=2, 
+        d_model=128,
+        nhead=4,
+        num_layers=2,
         max_sequence_length=max_sequence_length
     )
-    
+
     model = model.to(device)
-    
+
+    # 3b. Optional held-out validation dataloader (never trained on)
+    val_dataloader = None
+    if args.val_dataset_path:
+        if not os.path.exists(args.val_dataset_path):
+            print(f"WARNING: --val_dataset_path '{args.val_dataset_path}' not found. "
+                  f"Continuing without validation tracking.", file=sys.stderr)
+        else:
+            print(f"Initializing VALIDATION DataLoader for PCAP at: '{args.val_dataset_path}'...")
+            val_dataloader = get_pcap_dataloader(
+                pcap_path=args.val_dataset_path,
+                batch_size=batch_size,
+                num_workers=0,
+                max_sequence_length=max_sequence_length
+            )
+
     # 4. Initiate training
     print("\nStarting Kaggle Training session...")
     train_patcher_on_kosh(
@@ -239,7 +261,8 @@ def main():
         checkpoint_dir=args.checkpoints_dir,
         lr=args.lr,
         use_focal_loss=args.use_focal_loss,
-        focal_gamma=args.focal_gamma
+        focal_gamma=args.focal_gamma,
+        val_dataloader=val_dataloader
     )
     print("\nKaggle training script finished successfully!")
 

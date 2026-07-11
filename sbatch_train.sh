@@ -37,9 +37,11 @@ handle_terminate() {
 # Example: module load cuda/12.1 anaconda3
 # Feel free to adjust these module loads for the specific AI Kosh node layout
 
-# Read custom dataset path and epochs from arguments (fall back to defaults)
+# Read custom dataset path, epochs, and optional held-out validation path from arguments
+# Usage: sbatch sbatch_train.sh <train_pcap> <epochs> [val_pcap]
 DATASET_PATH=${1:-"./data/cic-ids2017/cic_ids.pcap"}
 EPOCHS=${2:-10}
+VAL_DATASET_PATH=${3:-""}
 
 # ─── Hugging Face Cloud Backup ────────────────────────────────────────────────
 # Checkpoints are automatically pushed to your HF Hub repo after every epoch.
@@ -106,7 +108,12 @@ fi
 
 # 2. Start training run in background so bash can trap signals
 echo "Launching training orchestrator on $DATASET_PATH for $EPOCHS epochs..."
-python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss True --focal_gamma 2.0 &
+if [ -n "$VAL_DATASET_PATH" ]; then
+    echo "Validation tracking enabled -> $VAL_DATASET_PATH"
+    python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss True --focal_gamma 2.0 --val_dataset_path "$VAL_DATASET_PATH" &
+else
+    python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss True --focal_gamma 2.0 &
+fi
 PYTHON_PID=$!
 
 # Wait for the python job to finish
