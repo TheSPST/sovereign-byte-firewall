@@ -118,7 +118,7 @@ def evaluate_validation_loss(model, val_dataloader, criterion, use_focal_loss, a
     return total_loss / steps
 
 
-def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000, val_dataloader=None):
+def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000, val_dataloader=None, total_steps_override=None):
     """
     Unified training loop for Kaggle (T4/P100) and AI Kosh (A100).
     Powered by Hugging Face Accelerate for maximum multi-GPU throughput.
@@ -128,6 +128,15 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
     every epoch and stored in the checkpoint's metadata as 'val_loss'. Use a
     genuinely disjoint file/time-range from the training set, or this number
     is meaningless.
+
+    total_steps_override (optional): explicit total optimizer-step count for the
+    OneCycleLR schedule. IMPORTANT for one-shot cluster runs: the streaming
+    dataset's __len__ is a file-size ESTIMATE on first pass (and a cached exact
+    count on later passes), so the LR schedule silently differs between run 1
+    and run 2 on identical data — and if the estimate is too LOW, the LR
+    anneals to ~0 early and the rest of the run trains at a dead learning rate.
+    Pass the known window count (e.g. from a manifest of a previous pass, or
+    steps/epoch observed on Kaggle) whenever you have it.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -145,7 +154,24 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     
-    total_steps = epochs * len(dataloader)
+    if total_steps_override is not None:
+        total_steps = int(total_steps_override)
+        print(f"[SCHEDULER] Using explicit total_steps={total_steps} for OneCycleLR.")
+    else:
+        total_steps = epochs * len(dataloader)
+        ds = getattr(dataloader, "dataset", None)
+        is_estimate = ds is not None and getattr(ds, "cached_sequences", None) is None
+        if is_estimate:
+            # Underestimating total_steps is far worse than overestimating it:
+            # too low => LR hits ~0 early and the remaining data trains at a dead
+            # LR; too high => the run merely ends mid-anneal at a healthy LR.
+            # Bias the schedule upward to protect one-shot cluster time.
+            total_steps = int(total_steps * 1.5)
+            print(f"[SCHEDULER] WARNING: dataset length is a file-size ESTIMATE (no manifest cache). "
+                  f"Padding OneCycleLR total_steps by 1.5x to {total_steps} to avoid a premature "
+                  f"LR collapse. Pass total_steps_override for an exact schedule.")
+        else:
+            print(f"[SCHEDULER] OneCycleLR total_steps={total_steps} (from cached manifest count).")
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=5e-4,
