@@ -39,8 +39,20 @@ handle_terminate() {
 
 # Read custom dataset path, epochs, and optional held-out validation path from arguments
 # Usage: sbatch sbatch_train.sh <train_pcap> <epochs> [val_pcap]
+#
+# IMPORTANT: the default DATASET_PATH below is a placeholder / historically a
+# 0-byte empty file in this project. ALWAYS pass the real training pcap
+# explicitly as $1 (e.g. the Monday-clean split), do not rely on the default.
+#
+# IMPORTANT: EPOCHS defaults to 1, not more. We have direct evidence from this
+# project that repeating epochs over the same training file causes real
+# regression (zero-day detection rate dropped from 32% to ~6% once training
+# started re-seeing the same Monday file a 2nd/3rd time) — more epochs is not
+# automatically better here. Monitor pushed checkpoints via evaluate_zero_day.py
+# during the run and kill the job early if detection stops improving, rather
+# than trusting it to run unattended for the full epoch count.
 DATASET_PATH=${1:-"./data/cic-ids2017/cic_ids.pcap"}
-EPOCHS=${2:-10}
+EPOCHS=${2:-1}
 VAL_DATASET_PATH=${3:-""}
 
 # ─── Hugging Face Cloud Backup ────────────────────────────────────────────────
@@ -64,7 +76,15 @@ VAL_DATASET_PATH=${3:-""}
 #   export HF_REPO_ID="TheSPST/sovereign-byte-firewall"
 #
 # Leave HF_REPO_ID blank to disable cloud backup entirely (training still runs).
-export HF_REPO_ID="${HF_REPO_ID:-spst01/sovereign-byte-firewall}"  # ← your HF repo
+#
+# IMPORTANT: this defaults to a NEW repo name, deliberately different from
+# spst01/sovereign-byte-firewall and spst01/sovereign-byte-firewall-monday
+# (both already in use from earlier Kaggle runs). A fresh run starting from
+# global_step=0 will re-create filenames like gs5000/gs10000/etc, which would
+# collide with and be easy to confuse with unrelated old checkpoints of the
+# same name if pushed into a shared repo. Override with
+# `export HF_REPO_ID=...` before calling sbatch if you want a different name.
+export HF_REPO_ID="${HF_REPO_ID:-spst01/sovereign-byte-firewall-aikosh}"  # ← your HF repo
 export HF_TOKEN="${HF_TOKEN:-}"             # optional — hf auth login is preferred
 
 # Pre-flight: warn if no auth method is found
@@ -107,12 +127,36 @@ if [ $? -ne 0 ]; then
 fi
 
 # 2. Start training run in background so bash can trap signals
+#
+# IMPORTANT: --use_focal_loss is False here, not True. FocalLoss was tested
+# extensively earlier in this project and found to be both theoretically
+# wrong for this near-balanced 256-byte-vocab next-token task (it suppresses
+# learning from common/easy tokens, which here means suppressing the model's
+# ability to learn genuinely "normal" byte patterns) and numerically fragile
+# under fp16 (GradScaler silently skipping most optimizer steps). Plain
+# CrossEntropy (with ignore_index=-1 for the -1 padding sentinel) is the
+# proven-better config that produced every usable checkpoint in this project
+# (gs590000 onward). Do not switch this back to True without re-deriving why.
+#
+# TOTAL_STEPS (optional env var): exact OneCycleLR step count. On a FIRST pass
+# over a file the dataset length is only a file-size estimate, so the LR
+# schedule is approximate (run_training pads it 1.5x to avoid a premature LR
+# collapse). If you know the real windows-per-epoch count from a previous run
+# (e.g. the Kaggle run over the same Monday file), export TOTAL_STEPS before
+# sbatch for an exact schedule:  export TOTAL_STEPS=900000
+TOTAL_STEPS="${TOTAL_STEPS:-}"
+TOTAL_STEPS_FLAG=""
+if [ -n "$TOTAL_STEPS" ]; then
+    echo "Exact OneCycleLR schedule requested -> total_steps=$TOTAL_STEPS"
+    TOTAL_STEPS_FLAG="--total_steps $TOTAL_STEPS"
+fi
+
 echo "Launching training orchestrator on $DATASET_PATH for $EPOCHS epochs..."
 if [ -n "$VAL_DATASET_PATH" ]; then
     echo "Validation tracking enabled -> $VAL_DATASET_PATH"
-    python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss True --focal_gamma 2.0 --val_dataset_path "$VAL_DATASET_PATH" &
+    python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss False --val_dataset_path "$VAL_DATASET_PATH" $TOTAL_STEPS_FLAG &
 else
-    python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss True --focal_gamma 2.0 &
+    python run_training.py --dataset_path "$DATASET_PATH" --epochs "$EPOCHS" --use_focal_loss False $TOTAL_STEPS_FLAG &
 fi
 PYTHON_PID=$!
 

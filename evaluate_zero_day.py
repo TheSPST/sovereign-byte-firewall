@@ -53,6 +53,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from sklearn.metrics import roc_curve, roc_auc_score
+from scipy.stats import genpareto
 
 from src.model import NetworkBytePatcher
 from src.dataloader import get_pcap_dataloader
@@ -74,6 +75,10 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--target_fpr", type=float, default=0.01,
                          help="Additionally report the threshold nearest this false-positive rate")
+    parser.add_argument("--evt_tail_quantile", type=float, default=0.98,
+                         help="Quantile of the calibration benign scores used as the EVT/POT "
+                              "initial high threshold before fitting the Generalized Pareto tail "
+                              "(default: 0.98, i.e. use the top 2%% of benign scores as the tail sample)")
     parser.add_argument("--output_dir", type=str, default="results/zero_day_eval")
     parser.add_argument("--score_agg", type=str, default="mean", choices=["mean", "max", "topk"],
                          help="How to collapse per-byte surprise into one per-window score. "
@@ -148,6 +153,9 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="m
         batch_size=batch_size,
         num_workers=0,
         max_sequence_length=max_sequence_length,
+        # Eval must not pollute data/anomaly_labels.csv with side-channel rows,
+        # and skipping the per-packet scapy parse roughly halves scoring time.
+        label_anomalies=False,
     )
 
     scores = []
@@ -220,6 +228,61 @@ def pick_thresholds(y_true, y_scores, target_fpr):
     }
 
 
+def fit_evt_threshold(benign_scores, target_fpr, tail_quantile=0.98):
+    """
+    Extreme Value Theory (Peaks-Over-Threshold) threshold selection.
+
+    Youden's J picks a threshold that maximizes (TPR - FPR) over the WHOLE
+    ROC curve — the right objective for overall separation, but the wrong
+    one when what actually matters operationally is the extreme tail (a
+    specific low FPR like 0.1-1%). Empirically across this project's
+    checkpoints, Youden's threshold has proven noisy: similar calibration
+    AUC has produced held-out detection rates swinging from ~3% to ~48%
+    depending on exactly where the ROC curve happened to bend on a finite
+    calibration sample.
+
+    POT instead: pick a high quantile `tail_quantile` of the calibration
+    BENIGN scores as an initial threshold t0, fit a Generalized Pareto
+    Distribution to the excesses above t0, then solve analytically for the
+    score threshold that should produce exactly `target_fpr` false
+    positives on benign data, under the fitted tail model. This targets the
+    tail directly instead of relying on wherever the calibration sample's
+    ROC curve happens to bend. Method follows Siffer et al., "Anomaly
+    Detection in Streams with Extreme Value Theory" (KDD 2017).
+    """
+    arr = np.sort(np.asarray(benign_scores, dtype=float))
+    n = len(arr)
+    if n < 30:
+        return None  # not enough calibration data for a meaningful tail fit
+
+    t0 = float(np.quantile(arr, tail_quantile))
+    excesses = arr[arr > t0] - t0
+    Nt = len(excesses)
+    if Nt < 10:
+        return None  # tail sample too thin to fit a GPD reliably
+
+    # Fit GPD to the excesses. loc is fixed at 0 since excesses are >= 0 by
+    # construction (they're defined as (score - t0) for scores above t0).
+    shape, _, scale = genpareto.fit(excesses, floc=0)
+
+    q = target_fpr
+    if abs(shape) < 1e-6:
+        # Degenerate GPD (shape -> 0) reduces to an exponential tail.
+        threshold = t0 - scale * math.log(q * n / Nt)
+    else:
+        threshold = t0 + (scale / shape) * (((n / Nt) * q) ** (-shape) - 1)
+
+    return {
+        "threshold": float(threshold),
+        "tail_quantile": tail_quantile,
+        "t0": t0,
+        "gpd_shape": float(shape),
+        "gpd_scale": float(scale),
+        "num_tail_points": Nt,
+        "target_fpr": target_fpr,
+    }
+
+
 def apply_threshold(scores, threshold):
     if not scores:
         return None
@@ -282,6 +345,14 @@ def main():
           f"{calib_metrics['target_fpr']['threshold']:.3f} bits "
           f"(TPR={calib_metrics['target_fpr']['tpr']:.3f}, FPR={calib_metrics['target_fpr']['fpr']:.3f})")
 
+    evt_result = fit_evt_threshold(benign_scores, args.target_fpr, tail_quantile=args.evt_tail_quantile)
+    if evt_result is not None:
+        print(f"EVT/POT threshold (targeting {args.target_fpr:.1%} FPR, GPD shape={evt_result['gpd_shape']:.3f}, "
+              f"{evt_result['num_tail_points']} tail points above the {args.evt_tail_quantile:.0%} quantile): "
+              f"{evt_result['threshold']:.3f} bits")
+    else:
+        print("EVT/POT threshold: skipped (not enough calibration benign windows for a reliable tail fit)")
+
     # --- True held-out generalization check ---
     print(f"\nScoring HELD-OUT benign file (never used for calibration): {args.benign_holdout_pcap}")
     holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len,
@@ -293,9 +364,13 @@ def main():
                                         agg=args.score_agg, topk_frac=args.topk_frac)
     print(f"  -> {len(holdout_attack_scores)} windows scored")
 
+    threshold_candidates = [("youden", calib_metrics["youden"]["threshold"]),
+                            ("target_fpr", calib_metrics["target_fpr"]["threshold"])]
+    if evt_result is not None:
+        threshold_candidates.append(("evt", evt_result["threshold"]))
+
     holdout_results = {}
-    for label, thresh in [("youden", calib_metrics["youden"]["threshold"]),
-                           ("target_fpr", calib_metrics["target_fpr"]["threshold"])]:
+    for label, thresh in threshold_candidates:
         holdout_results[label] = {
             "threshold": thresh,
             "holdout_benign_false_positive_rate": apply_threshold(holdout_benign_scores, thresh),
@@ -324,6 +399,7 @@ def main():
             "auc": calib_metrics["auc"],
             "youden": calib_metrics["youden"],
             "target_fpr": calib_metrics["target_fpr"],
+            "evt": evt_result,
             "per_file_mean_score": {
                 "benign_calibration": float(np.mean(benign_scores)),
                 **{k: float(np.mean(v)) for k, v in per_file_attack_scores.items() if v},
@@ -371,6 +447,10 @@ def main():
                   density=True, histtype="step", linewidth=2)
     plt.axvline(calib_metrics["youden"]["threshold"], color="black", linestyle="--",
                 label=f"Youden threshold ({calib_metrics['youden']['threshold']:.2f} bits)")
+    if evt_result is not None:
+        plt.axvline(evt_result["threshold"], color="#9467bd", linestyle=":",
+                    linewidth=2,
+                    label=f"EVT/POT threshold ({evt_result['threshold']:.2f} bits, target {args.target_fpr:.1%} FPR)")
     plt.xlabel(f"Next-Byte Surprise (bits), agg={agg_label}")
     plt.ylabel("Density")
     plt.title(f"Zero-Day Proof-of-Work: Score Distributions (agg={agg_label})")

@@ -78,8 +78,22 @@ def parse_args():
     parser.add_argument(
         "--use_focal_loss",
         type=str2bool,
-        default=True,
-        help="Use Focal Loss instead of standard Cross Entropy (default: True)"
+        default=False,
+        help="Use Focal Loss instead of standard Cross Entropy. Default is False: "
+             "FocalLoss was tested earlier in the project and produced strictly "
+             "worse convergence on this task than plain CrossEntropyLoss "
+             "(sbatch_train.sh already passes False explicitly; this default is "
+             "defense-in-depth for anyone invoking run_training.py directly)."
+    )
+    parser.add_argument(
+        "--total_steps",
+        type=int,
+        default=None,
+        help="Explicit OneCycleLR total step count. The streaming dataset's length "
+             "is a file-size estimate on first pass, so pass the known window count "
+             "(e.g. steps/epoch observed on a previous Kaggle run) to get an exact "
+             "LR schedule on one-shot cluster time. (default: None = estimate, "
+             "padded 1.5x for safety)"
     )
     parser.add_argument(
         "--focal_gamma",
@@ -176,7 +190,8 @@ def main():
         lr=args.lr,
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
-        val_dataloader=val_dataloader
+        val_dataloader=val_dataloader,
+        total_steps_override=args.total_steps
     )
     
     print("\nOrchestrated training job completed successfully!")
