@@ -104,7 +104,7 @@ def run_dry_run(device, dataset_path):
     
     # Run exactly 5 dry run batches
     print("Executing 5-batch forward pass dry run...")
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
     
     with torch.no_grad():
         for step, batch in enumerate(dataloader):

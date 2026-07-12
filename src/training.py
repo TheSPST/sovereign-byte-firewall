@@ -160,7 +160,7 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
         from src.losses import FocalLoss
         criterion = FocalLoss(gamma=focal_gamma, ignore_index=-1)
     else:
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
         
     # --- ACCELERATE PREPARE ---
     # This automatically distributes the model across GPUs and prepares the dataloader

@@ -75,6 +75,15 @@ def parse_args():
     parser.add_argument("--target_fpr", type=float, default=0.01,
                          help="Additionally report the threshold nearest this false-positive rate")
     parser.add_argument("--output_dir", type=str, default="results/zero_day_eval")
+    parser.add_argument("--score_agg", type=str, default="mean", choices=["mean", "max", "topk"],
+                         help="How to collapse per-byte surprise into one per-window score. "
+                              "'mean' is the original methodology (can dilute a small anomalous "
+                              "trigger inside a mostly-ordinary window). 'max' uses the single most "
+                              "surprising byte in the window. 'topk' averages the top --topk_frac "
+                              "fraction of bytes by surprise (a smoothed version of 'max').")
+    parser.add_argument("--topk_frac", type=float, default=0.1,
+                         help="Fraction of bytes (by surprise, highest first) to average when "
+                              "--score_agg=topk (default: 0.1 = top 10%% of the window)")
     return parser.parse_args()
 
 
@@ -114,11 +123,21 @@ def load_model(checkpoint_path, device, override_seq_len=None):
 
 
 @torch.no_grad()
-def score_pcap(model, pcap_path, device, batch_size, max_sequence_length):
+def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="mean", topk_frac=0.1):
     """
-    Returns a list of per-window "surprise" scores (bits) — mean negative
-    log2 probability the model assigned to the true next byte in each
-    window. NaN-safe against -1 padding sentinels.
+    Returns a list of per-window "surprise" scores (bits) — negative log2
+    probability the model assigned to the true next byte in each window,
+    collapsed to one score per window via `agg`. NaN-safe against -1
+    padding sentinels.
+
+    agg="mean"  : average surprise across the whole window (original method;
+                  a small anomalous trigger inside a mostly-ordinary window
+                  gets diluted by all the ordinary bytes around it).
+    agg="max"   : the single most surprising byte in the window. Sensitive
+                  to a lone outlier, but can be noisy (one weird-but-benign
+                  byte can trigger it).
+    agg="topk"  : average of the top `topk_frac` fraction of bytes by
+                  surprise — a smoothed middle ground between mean and max.
     """
     if not os.path.exists(pcap_path):
         print(f"  WARNING: '{pcap_path}' not found, skipping.")
@@ -145,8 +164,28 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length):
         token_logprob = log_probs.gather(-1, gather_idx).squeeze(-1)
         surprise_bits = -token_logprob / math.log(2)
 
-        surprise_bits = surprise_bits.masked_fill(~valid_mask, float("nan"))
-        per_window = torch.nanmean(surprise_bits, dim=1).cpu().numpy()
+        valid_counts = valid_mask.sum(dim=1)
+
+        if agg == "mean":
+            surprise_masked = surprise_bits.masked_fill(~valid_mask, float("nan"))
+            per_window = torch.nanmean(surprise_masked, dim=1)
+        elif agg == "max":
+            filled = torch.where(valid_mask, surprise_bits, torch.full_like(surprise_bits, float("-inf")))
+            per_window = filled.max(dim=1).values
+            per_window = torch.where(valid_counts > 0, per_window, torch.full_like(per_window, float("nan")))
+        elif agg == "topk":
+            filled = torch.where(valid_mask, surprise_bits, torch.full_like(surprise_bits, float("-inf")))
+            k = max(1, min(filled.shape[1], int(round(topk_frac * filled.shape[1]))))
+            topk_vals, _ = torch.topk(filled, k=k, dim=1)
+            topk_valid = torch.isfinite(topk_vals)
+            topk_vals = torch.where(topk_valid, topk_vals, torch.zeros_like(topk_vals))
+            denom = topk_valid.sum(dim=1).clamp(min=1)
+            per_window = topk_vals.sum(dim=1) / denom
+            per_window = torch.where(valid_counts > 0, per_window, torch.full_like(per_window, float("nan")))
+        else:
+            raise ValueError(f"Unknown --score_agg: {agg}")
+
+        per_window = per_window.cpu().numpy()
         scores.extend([s for s in per_window.tolist() if not math.isnan(s)])
 
     return scores
@@ -198,6 +237,8 @@ def main():
     print("   ZERO-DAY PROOF-OF-WORK EVALUATION HARNESS")
     print("==================================================")
     print(f"Device: {device}")
+    agg_label = f"{args.score_agg}" + (f" (top {args.topk_frac:.0%})" if args.score_agg == "topk" else "")
+    print(f"Score aggregation: {agg_label}")
 
     model, max_seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
 
@@ -212,14 +253,16 @@ def main():
 
     # --- Calibration set ---
     print(f"\nScoring benign calibration file: {args.benign_calibration_pcap}")
-    benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len)
+    benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
+                                agg=args.score_agg, topk_frac=args.topk_frac)
     print(f"  -> {len(benign_scores)} windows scored")
 
     per_file_attack_scores = {}
     attack_scores = []
     for f in attack_files:
         print(f"Scoring attack file: {f}")
-        s = score_pcap(model, f, device, args.batch_size, max_seq_len)
+        s = score_pcap(model, f, device, args.batch_size, max_seq_len,
+                        agg=args.score_agg, topk_frac=args.topk_frac)
         print(f"  -> {len(s)} windows scored")
         per_file_attack_scores[os.path.basename(f)] = s
         attack_scores.extend(s)
@@ -241,11 +284,13 @@ def main():
 
     # --- True held-out generalization check ---
     print(f"\nScoring HELD-OUT benign file (never used for calibration): {args.benign_holdout_pcap}")
-    holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len)
+    holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len,
+                                        agg=args.score_agg, topk_frac=args.topk_frac)
     print(f"  -> {len(holdout_benign_scores)} windows scored")
 
     print(f"Scoring HELD-OUT attack file (never used for calibration): {args.holdout_attack_pcap}")
-    holdout_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len)
+    holdout_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
+                                        agg=args.score_agg, topk_frac=args.topk_frac)
     print(f"  -> {len(holdout_attack_scores)} windows scored")
 
     holdout_results = {}
@@ -269,6 +314,8 @@ def main():
     metrics = {
         "checkpoint_path": args.checkpoint_path,
         "max_sequence_length": max_seq_len,
+        "score_agg": args.score_agg,
+        "topk_frac": args.topk_frac if args.score_agg == "topk" else None,
         "calibration": {
             "benign_file": args.benign_calibration_pcap,
             "attack_files": list(per_file_attack_scores.keys()),
@@ -304,7 +351,7 @@ def main():
                 color="#d62728", zorder=5, label="Youden's J threshold")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title("Zero-Day Proof-of-Work: Calibration ROC Curve")
+    plt.title(f"Zero-Day Proof-of-Work: Calibration ROC Curve (agg={agg_label})")
     plt.legend(loc="lower right")
     plt.grid(True, linestyle=":", alpha=0.5)
     roc_path = os.path.join(args.output_dir, "roc_curve.png")
@@ -324,9 +371,9 @@ def main():
                   density=True, histtype="step", linewidth=2)
     plt.axvline(calib_metrics["youden"]["threshold"], color="black", linestyle="--",
                 label=f"Youden threshold ({calib_metrics['youden']['threshold']:.2f} bits)")
-    plt.xlabel("Mean Next-Byte Surprise (bits)")
+    plt.xlabel(f"Next-Byte Surprise (bits), agg={agg_label}")
     plt.ylabel("Density")
-    plt.title("Zero-Day Proof-of-Work: Score Distributions")
+    plt.title(f"Zero-Day Proof-of-Work: Score Distributions (agg={agg_label})")
     plt.legend()
     plt.grid(True, linestyle=":", alpha=0.5)
     dist_path = os.path.join(args.output_dir, "score_distribution.png")
