@@ -43,6 +43,8 @@ import sys
 import json
 import glob
 import math
+import zlib
+import bz2
 import argparse
 
 import numpy as np
@@ -89,6 +91,24 @@ def parse_args():
     parser.add_argument("--topk_frac", type=float, default=0.1,
                          help="Fraction of bytes (by surprise, highest first) to average when "
                               "--score_agg=topk (default: 0.1 = top 10%% of the window)")
+    parser.add_argument("--complexity_correction", type=str, default="none",
+                         choices=["none", "zlib", "bz2"],
+                         help="Input-complexity corrected score (Serra et al., ICLR 2020, "
+                              "arXiv:1909.11480). Likelihood-based anomaly scores are known to be "
+                              "confounded by raw input COMPLEXITY: a window of ciphertext gets high "
+                              "surprise simply because it is incompressible, not because it violates "
+                              "learned protocol grammar — the classic failure mode of NLL-based OOD "
+                              "detection (Nalisnick et al., arXiv:1810.09136). The fix is a "
+                              "likelihood-ratio-style score S(x) = NLL(x) - L(x), where L(x) is a "
+                              "universal-compressor estimate of the window's Kolmogorov complexity "
+                              "(bits/byte via zlib or bz2). Structured-but-unusual attack bytes keep "
+                              "a high corrected score; mere randomness is cancelled out.")
+    parser.add_argument("--typicality", action="store_true", default=False,
+                         help="Two-sided typicality score |s - mean(benign calibration s)| "
+                              "(Nalisnick et al., arXiv:1906.02994): flags windows that are "
+                              "TOO-predictable as well as too-surprising. Catches low-entropy "
+                              "attacks (padding floods, repeated probes, C2 heartbeats) that "
+                              "one-sided surprise misses by construction.")
     return parser.parse_args()
 
 
@@ -127,8 +147,25 @@ def load_model(checkpoint_path, device, override_seq_len=None):
     return model, eval_window_len
 
 
+def _window_complexity_bits_per_byte(rows, method):
+    """
+    Universal-compressor estimate L(x) of each window's complexity, in bits/byte.
+    rows: (B, T) numpy int array with -1 padding sentinels.
+    """
+    out = np.full(rows.shape[0], np.nan, dtype=np.float64)
+    for i, row in enumerate(rows):
+        valid = row[row >= 0]
+        if valid.size == 0:
+            continue
+        raw = valid.astype(np.uint8).tobytes()
+        comp = zlib.compress(raw, 6) if method == "zlib" else bz2.compress(raw, 9)
+        out[i] = 8.0 * len(comp) / len(raw)
+    return out
+
+
 @torch.no_grad()
-def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="mean", topk_frac=0.1):
+def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="mean", topk_frac=0.1,
+               complexity_correction="none"):
     """
     Returns a list of per-window "surprise" scores (bits) — negative log2
     probability the model assigned to the true next byte in each window,
@@ -160,6 +197,11 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="m
 
     scores = []
     for batch in dataloader:
+        comp_bits = None
+        if complexity_correction != "none":
+            # Complexity of the TARGET bytes (batch[:, 1:]), matching what the
+            # surprise score is computed over. Done on the CPU copy pre-transfer.
+            comp_bits = _window_complexity_bits_per_byte(batch[:, 1:].numpy(), complexity_correction)
         batch = batch.to(device)
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
@@ -194,6 +236,13 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="m
             raise ValueError(f"Unknown --score_agg: {agg}")
 
         per_window = per_window.cpu().numpy()
+        if comp_bits is not None:
+            # Likelihood-ratio-style correction: S = NLL - L (both bits/byte).
+            # For agg="mean" this is exactly Serra et al.'s parameter-free OOD
+            # score restricted to the window; for max/topk it is the same
+            # correction applied to the aggregated statistic (heuristic but
+            # consistently applied to benign and attack windows alike).
+            per_window = per_window - comp_bits
         scores.extend([s for s in per_window.tolist() if not math.isnan(s)])
 
     return scores
@@ -301,6 +350,10 @@ def main():
     print("==================================================")
     print(f"Device: {device}")
     agg_label = f"{args.score_agg}" + (f" (top {args.topk_frac:.0%})" if args.score_agg == "topk" else "")
+    if args.complexity_correction != "none":
+        agg_label += f" - {args.complexity_correction} complexity"
+    if args.typicality:
+        agg_label = f"|{agg_label} - benign mean|"
     print(f"Score aggregation: {agg_label}")
 
     model, max_seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
@@ -317,7 +370,8 @@ def main():
     # --- Calibration set ---
     print(f"\nScoring benign calibration file: {args.benign_calibration_pcap}")
     benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
-                                agg=args.score_agg, topk_frac=args.topk_frac)
+                                agg=args.score_agg, topk_frac=args.topk_frac,
+                                complexity_correction=args.complexity_correction)
     print(f"  -> {len(benign_scores)} windows scored")
 
     per_file_attack_scores = {}
@@ -325,7 +379,8 @@ def main():
     for f in attack_files:
         print(f"Scoring attack file: {f}")
         s = score_pcap(model, f, device, args.batch_size, max_seq_len,
-                        agg=args.score_agg, topk_frac=args.topk_frac)
+                        agg=args.score_agg, topk_frac=args.topk_frac,
+                        complexity_correction=args.complexity_correction)
         print(f"  -> {len(s)} windows scored")
         per_file_attack_scores[os.path.basename(f)] = s
         attack_scores.extend(s)
@@ -333,6 +388,20 @@ def main():
     if not benign_scores or not attack_scores:
         print("ERROR: Insufficient calibration data (need both benign and attack windows).", file=sys.stderr)
         sys.exit(1)
+
+    # --- Optional two-sided typicality transform (arXiv:1906.02994) ---
+    # High likelihood is NOT the same as typical: benign traffic concentrates in
+    # a typical set of near-average surprise, and anomalies can fall on EITHER
+    # side (ciphertext-like: too surprising; padding floods / repeated probes:
+    # too predictable). The transform |s - mu_benign| makes both tails score high.
+    typicality_mu = None
+    if args.typicality:
+        typicality_mu = float(np.mean(benign_scores))
+        print(f"Typicality transform enabled: mu_benign = {typicality_mu:.3f} bits")
+        benign_scores = [abs(s - typicality_mu) for s in benign_scores]
+        attack_scores = [abs(s - typicality_mu) for s in attack_scores]
+        per_file_attack_scores = {k: [abs(s - typicality_mu) for s in v]
+                                  for k, v in per_file_attack_scores.items()}
 
     y_true = np.array([0] * len(benign_scores) + [1] * len(attack_scores))
     y_scores = np.array(benign_scores + attack_scores)
@@ -356,13 +425,20 @@ def main():
     # --- True held-out generalization check ---
     print(f"\nScoring HELD-OUT benign file (never used for calibration): {args.benign_holdout_pcap}")
     holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len,
-                                        agg=args.score_agg, topk_frac=args.topk_frac)
+                                        agg=args.score_agg, topk_frac=args.topk_frac,
+                                        complexity_correction=args.complexity_correction)
     print(f"  -> {len(holdout_benign_scores)} windows scored")
 
     print(f"Scoring HELD-OUT attack file (never used for calibration): {args.holdout_attack_pcap}")
     holdout_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
-                                        agg=args.score_agg, topk_frac=args.topk_frac)
+                                        agg=args.score_agg, topk_frac=args.topk_frac,
+                                        complexity_correction=args.complexity_correction)
     print(f"  -> {len(holdout_attack_scores)} windows scored")
+
+    if typicality_mu is not None:
+        # Same transform, same mu (fit on calibration benign only — no leakage).
+        holdout_benign_scores = [abs(s - typicality_mu) for s in holdout_benign_scores]
+        holdout_attack_scores = [abs(s - typicality_mu) for s in holdout_attack_scores]
 
     threshold_candidates = [("youden", calib_metrics["youden"]["threshold"]),
                             ("target_fpr", calib_metrics["target_fpr"]["threshold"])]
@@ -391,6 +467,9 @@ def main():
         "max_sequence_length": max_seq_len,
         "score_agg": args.score_agg,
         "topk_frac": args.topk_frac if args.score_agg == "topk" else None,
+        "complexity_correction": args.complexity_correction,
+        "typicality": args.typicality,
+        "typicality_mu": typicality_mu,
         "calibration": {
             "benign_file": args.benign_calibration_pcap,
             "attack_files": list(per_file_attack_scores.keys()),
