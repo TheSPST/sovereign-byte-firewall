@@ -182,6 +182,72 @@ def test_addresses_still_masked():
     assert out[14 + 12: 14 + 20] == b"\x00" * 8          # IPs
 
 
+def build_packet_noisy_headers(payload=b"", sport=50000, dport=80):
+    """Frame with realistic random-ish values in the stochastic header fields."""
+    pkt = bytearray(build_packet(payload, sport=sport, dport=dport))
+    ip_off, tcp_off = 14, 34
+    pkt[ip_off + 4: ip_off + 6] = b"\xAB\xCD"     # IP ID
+    pkt[ip_off + 8] = 64                          # TTL (should SURVIVE)
+    pkt[ip_off + 10: ip_off + 12] = b"\x12\x34"   # IP checksum
+    pkt[tcp_off + 4: tcp_off + 12] = bytes(range(0x60, 0x68))  # seq+ack
+    pkt[tcp_off + 13] = 0x12                      # flags SYN+ACK (should SURVIVE)
+    pkt[tcp_off + 14: tcp_off + 16] = b"\xFF\xEE"  # window (should SURVIVE)
+    pkt[tcp_off + 16: tcp_off + 18] = b"\x56\x78"  # TCP checksum
+    return bytes(pkt)
+
+
+def test_stochastic_header_fields_masked_grammar_fields_kept():
+    """(e) seq/ack/checksums/IP-ID masked; ports/flags/window/TTL survive."""
+    out = mask(build_packet_noisy_headers(), {})
+    ip_off, tcp_off = 14, 34
+    assert out[ip_off + 4: ip_off + 6] == b"\x00\x00", "IP ID must be masked"
+    assert out[ip_off + 10: ip_off + 12] == b"\x00\x00", "IP checksum must be masked"
+    assert out[tcp_off + 4: tcp_off + 12] == b"\x00" * 8, "TCP seq/ack must be masked"
+    assert out[tcp_off + 16: tcp_off + 18] == b"\x00\x00", "TCP checksum must be masked"
+    # grammar-bearing fields must survive
+    assert out[ip_off + 8] == 64, "TTL must stay visible"
+    assert out[tcp_off: tcp_off + 2] == (50000).to_bytes(2, "big"), "sport must stay visible"
+    assert out[tcp_off + 2: tcp_off + 4] == (80).to_bytes(2, "big"), "dport must stay visible"
+    assert out[tcp_off + 13] == 0x12, "TCP flags must stay visible"
+    assert out[tcp_off + 14: tcp_off + 16] == b"\xFF\xEE", "window must stay visible"
+
+
+def build_udp_packet(payload, sport=50000, dport=443):
+    """Minimal Ethernet + IPv4 + UDP frame."""
+    eth = bytes([0xAA] * 6 + [0xBB] * 6) + b"\x08\x00"
+    ip = bytearray(20)
+    ip[0] = 0x45
+    ip[9] = 17                        # protocol UDP
+    ip[12:16] = SRC_IP
+    ip[16:20] = DST_IP
+    udp = bytearray(8)
+    udp[0:2] = sport.to_bytes(2, "big")
+    udp[2:4] = dport.to_bytes(2, "big")
+    udp[4:6] = (8 + len(payload)).to_bytes(2, "big")
+    udp[6:8] = b"\x9A\xBC"            # checksum
+    return eth + bytes(ip) + bytes(udp) + payload
+
+
+def test_quic_udp443_payload_masked():
+    """(f) QUIC (UDP/443) is encrypted end-to-end -> payload fully masked."""
+    quic_payload = bytes(range(48))
+    out = mask(build_udp_packet(quic_payload, dport=443), {})
+    udp_off = 34
+    assert out[udp_off + 6: udp_off + 8] == b"\x00\x00", "UDP checksum must be masked"
+    assert out[udp_off + 8:] == b"\x00" * 48, "QUIC payload must be masked"
+    # ports + length survive
+    assert out[udp_off + 2: udp_off + 4] == (443).to_bytes(2, "big")
+    assert out[udp_off + 4: udp_off + 6] == (56).to_bytes(2, "big")
+
+
+def test_plain_udp_payload_stays_visible():
+    """DNS-style UDP payload must NOT be masked (it has learnable grammar)."""
+    dns_payload = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    out = mask(build_udp_packet(dns_payload, dport=53), {})
+    udp_off = 34
+    assert out[udp_off + 8:] == dns_payload
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
