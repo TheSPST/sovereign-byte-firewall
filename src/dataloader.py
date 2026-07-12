@@ -18,6 +18,9 @@ from scapy.layers.inet import IP, TCP
 TLS_PORTS = frozenset({443, 8443, 993, 995, 465, 990, 636})
 # TCP ports treated as SSH: mask all payload except the plaintext version banner.
 SSH_PORTS = frozenset({22})
+# UDP ports whose payload is (essentially) always encrypted:
+# 443 QUIC/HTTP3, 4500 IPsec NAT-T, 51820 WireGuard, 1194 OpenVPN
+UDP_ENCRYPTED_PORTS = frozenset({443, 4500, 51820, 1194})
 
 class RawPcapIterableDataset(IterableDataset):
     """
@@ -180,6 +183,18 @@ class RawPcapIterableDataset(IterableDataset):
             plus SSH (port 22): all SSH payload except the plaintext
             "SSH-" version banner is masked, since post-banner SSH traffic
             is (mostly) encrypted and was training as ciphertext noise.
+        (e) Stochastic HEADER fields masked. Guiding principle: mask any
+            byte that is irreducibly random under benign traffic, keep any
+            byte that carries protocol grammar. TCP seq/ack (random ISNs, 8
+            bytes/packet — benign traffic is dominated by small ACKs, so
+            this was ~15% noise per ACK frame), TCP+IP checksums (derived
+            from already-masked fields => effectively random), IPv4 ID,
+            IPv6 flow label. Ports, flags, window, TTL, lengths stay
+            visible — they carry signal (scans, floods, weird services).
+        (f) UDP finally parsed: UDP checksum masked, and payload on
+            always-encrypted UDP ports (QUIC 443, WireGuard, OpenVPN,
+            IPsec NAT-T) fully masked — QUIC was previously 100% unmasked
+            ciphertext in training data.
         """
         pkt_bytes = bytearray(packet_data)
         n = len(pkt_bytes)
@@ -225,9 +240,10 @@ class RawPcapIterableDataset(IterableDataset):
             else:
                 resolved_ethertype = None
                 
-        # 3. Protocol-Specific L3 Address Masking
+        # 3. Protocol-Specific L3 Address & Stochastic-Field Masking
         l4_offset = None
         is_tcp = False
+        is_udp = False
         # Raw (pre-mask) address bytes, captured for the TLS stream-state key
         # before the address-blanking below zeroes them out in pkt_bytes.
         raw_src_ip = None
@@ -238,38 +254,67 @@ class RawPcapIterableDataset(IterableDataset):
                 raw_src_ip = bytes(pkt_bytes[l3_offset + 12 : l3_offset + 16])
                 raw_dst_ip = bytes(pkt_bytes[l3_offset + 16 : l3_offset + 20])
                 pkt_bytes[l3_offset + 12 : l3_offset + 20] = b'\x00' * 8
+                # Stochastic per-packet fields (see docstring FIX (e)):
+                pkt_bytes[l3_offset + 4 : l3_offset + 6] = b'\x00' * 2    # IP Identification (random per packet)
+                pkt_bytes[l3_offset + 10 : l3_offset + 12] = b'\x00' * 2  # header checksum (derives from masked fields)
 
                 protocol = pkt_bytes[l3_offset + 9]
+                ihl = pkt_bytes[l3_offset] & 0x0F
                 if protocol == 6:  # TCP
-                    ihl = pkt_bytes[l3_offset] & 0x0F
                     l4_offset = l3_offset + (ihl * 4)
                     is_tcp = True
+                elif protocol == 17:  # UDP
+                    l4_offset = l3_offset + (ihl * 4)
+                    is_udp = True
 
         elif resolved_ethertype == 0x86DD:  # IPv6
             if n >= l3_offset + 40:
                 raw_src_ip = bytes(pkt_bytes[l3_offset + 8 : l3_offset + 24])
                 raw_dst_ip = bytes(pkt_bytes[l3_offset + 24 : l3_offset + 40])
                 pkt_bytes[l3_offset + 8 : l3_offset + 40] = b'\x00' * 32
+                # Flow label (20 bits): pseudo-random per flow — mask it.
+                pkt_bytes[l3_offset + 1] &= 0xF0
+                pkt_bytes[l3_offset + 2 : l3_offset + 4] = b'\x00' * 2
 
                 next_header = pkt_bytes[l3_offset + 6]
                 if next_header == 6:  # TCP
                     l4_offset = l3_offset + 40
                     is_tcp = True
+                elif next_header == 17:  # UDP
+                    l4_offset = l3_offset + 40
+                    is_udp = True
                     
         elif resolved_ethertype == 0x0806:  # ARP
             if n >= l3_offset + 28:
                 pkt_bytes[l3_offset + 8 : l3_offset + 28] = b'\x00' * 20
                 
-        # 4. Layer 4 (TCP) & Layer 7 (TLS) Masking
+        # 4. Layer 4 (TCP/UDP) & Layer 7 (TLS/SSH/QUIC) Masking
+        if is_udp and l4_offset is not None and n >= l4_offset + 8:
+            udp_sport = (pkt_bytes[l4_offset] << 8) | pkt_bytes[l4_offset + 1]
+            udp_dport = (pkt_bytes[l4_offset + 2] << 8) | pkt_bytes[l4_offset + 3]
+            # UDP checksum: derives from masked fields => effectively random.
+            pkt_bytes[l4_offset + 6 : l4_offset + 8] = b'\x00' * 2
+            # Always-encrypted UDP protocols (QUIC/VPNs): mask whole payload.
+            if udp_sport in UDP_ENCRYPTED_PORTS or udp_dport in UDP_ENCRYPTED_PORTS:
+                if n > l4_offset + 8:
+                    pkt_bytes[l4_offset + 8 : n] = b'\x00' * (n - (l4_offset + 8))
+
         if is_tcp and l4_offset is not None:
             if n >= l4_offset + 20:
                 tcp_data_offset = (pkt_bytes[l4_offset + 12] >> 4) & 0x0F
                 tcp_header_len = tcp_data_offset * 4
-                
+
+                # Stochastic per-packet fields (see docstring FIX (e)):
+                pkt_bytes[l4_offset + 4 : l4_offset + 12] = b'\x00' * 8    # seq + ack numbers (random ISNs)
+                pkt_bytes[l4_offset + 16 : l4_offset + 18] = b'\x00' * 2   # TCP checksum
+                # Kept visible on purpose: ports, flags, window size, urgent
+                # pointer — all carry attack-relevant grammar (scans, floods,
+                # zero-window stalls, weird service targeting).
+
                 # Mask variable TCP options (if TCP options are present, i.e., header len > 20)
                 if tcp_header_len > 20 and n >= l4_offset + tcp_header_len:
                     pkt_bytes[l4_offset + 20 : l4_offset + tcp_header_len] = b'\x00' * (tcp_header_len - 20)
-                    
+
                 # Mask Encrypted TLS / SSH Payloads
                 sport = (pkt_bytes[l4_offset] << 8) | pkt_bytes[l4_offset + 1]
                 dport = (pkt_bytes[l4_offset + 2] << 8) | pkt_bytes[l4_offset + 3]
