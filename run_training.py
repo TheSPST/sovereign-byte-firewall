@@ -86,6 +86,16 @@ def parse_args():
              "defense-in-depth for anyone invoking run_training.py directly)."
     )
     parser.add_argument(
+        "--label_anomalies",
+        type=str2bool,
+        default=False,
+        help="Write the per-packet anomaly side-channel CSV during training "
+             "(default: False). The training loss NEVER consumes these labels, and "
+             "producing them costs a full scapy parse + entropy calculation per "
+             "packet inside the dataloader — a serious GPU-starvation risk on "
+             "cluster runs. Enable only for dedicated labeling passes."
+    )
+    parser.add_argument(
         "--total_steps",
         type=int,
         default=None,
@@ -157,8 +167,15 @@ def main():
     dataloader = get_pcap_dataloader(
         pcap_path=args.dataset_path,
         batch_size=args.batch_size,
-        num_workers=0,  # Single-process sequential stream is robust
-        max_sequence_length=args.max_sequence_length
+        # num_workers=1 (not 0): a SINGLE background worker keeps the packet
+        # stream sequential (cross-packet TLS masking state stays valid — the
+        # factory guard enforces <=1 when masking) while moving pcap parsing +
+        # masking + windowing OFF the training process, so batches prefetch
+        # while the GPU computes. num_workers=0 left the A100 waiting on the
+        # dataloader between every step.
+        num_workers=1,
+        max_sequence_length=args.max_sequence_length,
+        label_anomalies=args.label_anomalies
     )
     
     print("Initializing NetworkBytePatcher model (ultra-lightweight configuration)...")
@@ -177,8 +194,9 @@ def main():
             val_dataloader = get_pcap_dataloader(
                 pcap_path=args.val_dataset_path,
                 batch_size=args.batch_size,
-                num_workers=0,
-                max_sequence_length=args.max_sequence_length
+                num_workers=1,
+                max_sequence_length=args.max_sequence_length,
+                label_anomalies=False  # never label during validation scoring
             )
 
     print("\nStarting training orchestrator loop...")
