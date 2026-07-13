@@ -62,8 +62,10 @@ def parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=5,
-        help="Number of training epochs (default: 5)"
+        default=1,
+        help="Number of training epochs (default: 1 — project evidence shows repeating "
+             "epochs over the same file causes real regression: held-out detection "
+             "dropped 32%% -> ~6%% once training re-saw the same data)"
     )
     parser.add_argument(
         "--batch_size",
@@ -98,14 +100,40 @@ def parse_args():
     parser.add_argument(
         "--use_focal_loss",
         type=str2bool,
-        default=True,
-        help="Use Focal Loss instead of standard Cross Entropy (default: True)"
+        default=False,
+        help="Use Focal Loss instead of standard Cross Entropy (default: False — "
+             "FocalLoss was tested and produced strictly worse convergence on this "
+             "task; every usable checkpoint came from plain CrossEntropy)"
     )
     parser.add_argument(
         "--focal_gamma",
         type=float,
         default=2.0,
         help="Focusing parameter gamma for Focal Loss (default: 2.0)"
+    )
+    parser.add_argument(
+        "--label_anomalies",
+        type=str2bool,
+        default=False,
+        help="Write the per-packet anomaly side-channel CSV during training (default: "
+             "False — costs a full scapy parse per packet in the dataloader hot path "
+             "and the loss never consumes it)"
+    )
+    parser.add_argument(
+        "--total_steps",
+        type=int,
+        default=None,
+        help="Explicit OneCycleLR total step count (streaming dataset length is an "
+             "estimate on first pass; pass the known window count for an exact schedule)"
+    )
+    parser.add_argument(
+        "--allow_resume",
+        action="store_true",
+        default=False,
+        help="Allow auto-resume from an existing checkpoints/latest_patcher.pt. "
+             "OFF by default: the masking scheme changed (TLS continuation, header "
+             "stochastic fields, QUIC), so resuming a checkpoint trained under the OLD "
+             "preprocessing silently mixes incompatible data distributions."
     )
     return parser.parse_args()
 
@@ -217,14 +245,27 @@ def main():
     
     # 2. Automated data downloader
     handle_data_download(args.dataset_path, args.dataset_url)
-    
+
+    # 2b. Fresh-start guard: old-masking checkpoints must not be resumed silently.
+    stale_ckpt = os.path.join(args.checkpoints_dir, "latest_patcher.pt")
+    if os.path.exists(stale_ckpt) and not args.allow_resume:
+        print(f"ERROR: found existing checkpoint '{stale_ckpt}'.\n"
+              f"The masking scheme changed (TLS continuation, stochastic header fields, "
+              f"QUIC) — resuming a checkpoint trained under the OLD preprocessing mixes "
+              f"incompatible data distributions. Delete/move it for a fresh run, or pass "
+              f"--allow_resume ONLY if it was trained with the current masking.", file=sys.stderr)
+        sys.exit(1)
+
     # 3. Initialize model and dataloader
     print(f"\nInitializing DataLoader for PCAP at: '{args.dataset_path}'...")
     dataloader = get_pcap_dataloader(
         pcap_path=args.dataset_path,
         batch_size=batch_size,
-        num_workers=0,
-        max_sequence_length=max_sequence_length
+        # 1 background worker: sequential stream (TLS mask state valid) but pcap
+        # parse/mask/window runs off the training process so batches prefetch.
+        num_workers=1,
+        max_sequence_length=max_sequence_length,
+        label_anomalies=args.label_anomalies
     )
     
     print("Initializing NetworkBytePatcher (ultra-lightweight configuration)...")
@@ -248,8 +289,9 @@ def main():
             val_dataloader = get_pcap_dataloader(
                 pcap_path=args.val_dataset_path,
                 batch_size=batch_size,
-                num_workers=0,
-                max_sequence_length=max_sequence_length
+                num_workers=1,
+                max_sequence_length=max_sequence_length,
+                label_anomalies=False
             )
 
     # 4. Initiate training
@@ -262,7 +304,8 @@ def main():
         lr=args.lr,
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
-        val_dataloader=val_dataloader
+        val_dataloader=val_dataloader,
+        total_steps_override=args.total_steps
     )
     print("\nKaggle training script finished successfully!")
 
