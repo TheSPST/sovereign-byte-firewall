@@ -112,6 +112,12 @@ def parse_args():
                         "alarms inside interval+margin count as detections, and these regions "
                         "are excluded from false-alarm counting")
     p.add_argument("--output_dir", type=str, default="results/cic_day_eval")
+    p.add_argument("--stop_after", type=str, default=None,
+                   help="Local HH:MM at which to stop streaming (fast partial run). "
+                        "e.g. '11:30' on Wednesday covers the benign lead-in + all 4 DoS "
+                        "attacks (done by 11:23) and skips the afternoon Heartbleed — "
+                        "~half the runtime. Attacks after the cutoff are marked "
+                        "'outside captured range', not counted as missed.")
     return p.parse_args()
 
 
@@ -213,10 +219,23 @@ def main():
     model, seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
 
     # ---- Pass over the day (single streaming pass; scores + timestamps) ----
+    # --stop_after HH:MM: stop streaming once capture time passes this local
+    # clock. Lets you evaluate just the morning DoS block (all 4 DoS attacks
+    # finish by ~11:23) in ~half the runtime, skipping the afternoon. Attacks
+    # scheduled after the cutoff are reported as 'outside captured range'.
+    stop_epoch = None            # resolved lazily once we know the first timestamp
     scores, tss = [], []
     n = 0
     for s, t in stream_window_scores(model, device, args.pcap, seq_len,
                                      args.batch_size, args.score_agg, args.topk_frac):
+        if args.stop_after and stop_epoch is None:
+            _lt0 = datetime.datetime.utcfromtimestamp(t + args.utc_offset_hours * 3600)
+            _mid = t - (_lt0.hour * 3600 + _lt0.minute * 60 + _lt0.second)
+            _h, _m = map(int, args.stop_after.split(":"))
+            stop_epoch = _mid + _h * 3600 + _m * 60
+        if stop_epoch is not None and t > stop_epoch:
+            print(f"  [stop_after {args.stop_after}] reached — halting stream early.")
+            break
         scores.append(s)
         tss.append(t)
         n += 1
@@ -225,7 +244,8 @@ def main():
                   f"(capture time {datetime.datetime.utcfromtimestamp(t + args.utc_offset_hours * 3600):%H:%M})")
     scores = np.asarray(scores)
     tss = np.asarray(tss)
-    print(f"Total: {len(scores)} windows across the day")
+    print(f"Total: {len(scores)} windows scored"
+          + (f" (stopped at {args.stop_after} local)" if args.stop_after else " across the day"))
     if len(scores) < 1000:
         print("ERROR: too few windows.", file=sys.stderr)
         sys.exit(1)
@@ -281,8 +301,17 @@ def main():
     alarm_idx = cusum_alarm_indices(scores, chosen_h)
     alarm_ts = tss[alarm_idx] if alarm_idx else np.array([])
 
+    span_end_ts = float(tss.max())
     per_attack = {}
+    evaluated_intervals = []
     for name, s, e in intervals:
+        # Attack window falls entirely after where the stream stopped -> not evaluated.
+        if s > span_end_ts:
+            per_attack[name] = {"detected": None, "alarms_in_window": 0,
+                                "detection_delay_sec": None, "outside_captured_range": True}
+            print(f"  {name}: outside captured range (stream stopped before it)")
+            continue
+        evaluated_intervals.append((name, s, e))
         hits = alarm_ts[(alarm_ts >= s) & (alarm_ts <= e)] if len(alarm_ts) else np.array([])
         delay = float(hits.min() - (s + args.margin_minutes * 60)) if len(hits) else None
         per_attack[name] = {"detected": bool(len(hits)), "alarms_in_window": int(len(hits)),
@@ -292,17 +321,20 @@ def main():
               + (f", delay {delay:.0f}s" if delay is not None else "") + ")")
 
     in_any_attack = np.zeros(len(alarm_ts), dtype=bool)
-    for _, s, e in intervals:
+    for _, s, e in evaluated_intervals:
         in_any_attack |= (alarm_ts >= s) & (alarm_ts <= e)
-    # Benign evaluation time = post-fit capture span minus the attack intervals.
-    span_end = float(tss.max())
-    attack_secs = sum(max(0.0, min(e, span_end) - max(s, fit_end)) for _, s, e in intervals)
+    # Benign evaluation time = post-fit captured span minus the attack intervals.
+    span_end = span_end_ts
+    attack_secs = sum(max(0.0, min(e, span_end) - max(s, fit_end)) for _, s, e in evaluated_intervals)
     benign_hours = max(1e-9, ((span_end - fit_end) - attack_secs) / 3600.0)
     false_alarms = int((~in_any_attack).sum())
     detected = sum(1 for v in per_attack.values() if v["detected"])
+    n_evaluated = len(evaluated_intervals)
 
     print("\n================ SAME-ENVIRONMENT RESULTS ================")
-    print(f"Attacks detected: {detected}/{len(per_attack)}")
+    print(f"Attacks detected: {detected}/{n_evaluated} evaluated"
+          + (f" ({len(per_attack) - n_evaluated} outside captured range)"
+             if n_evaluated < len(per_attack) else ""))
     print(f"False alarms outside attack windows: {false_alarms} "
           f"(~{false_alarms / benign_hours:.2f}/hour of benign traffic)")
     print("===========================================================")
