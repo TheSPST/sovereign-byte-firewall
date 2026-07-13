@@ -62,8 +62,33 @@ def parse_args():
     p.add_argument("--poll_seconds", type=float, default=120.0)
     p.add_argument("--log_csv", default="/kaggle/working/eval_watcher_results.csv")
     p.add_argument("--ckpt_glob", default="*_mid_epoch.pt",
-                   help="Which checkpoints to evaluate (default: mid-epoch saves)")
+                   help="Local-source only: which checkpoints to evaluate")
+    p.add_argument("--checkpoint_source", default="hf", choices=["hf", "local"],
+                   help="Where to find checkpoints. 'hf' (default): pull gs-named "
+                        "checkpoints from the HF repo — REQUIRED on Kaggle, because "
+                        "training only writes a single overwritten 'latest_patcher.pt' "
+                        "locally; the distinct gs-named files exist ONLY on HF. "
+                        "'local': scan --checkpoints_dir with --ckpt_glob.")
+    p.add_argument("--hf_repo", default=os.environ.get("HF_REPO_ID", ""),
+                   help="HF repo to pull checkpoints from (default: $HF_REPO_ID)")
+    p.add_argument("--hf_download_dir", default="/kaggle/working/hf_ckpt_eval",
+                   help="Where to stage checkpoints downloaded from HF for scoring")
     return p.parse_args()
+
+
+def hf_list_checkpoints(repo_id):
+    """Return HF checkpoint files (checkpoints/*.pt) newest-first by gs step."""
+    import re
+    from huggingface_hub import HfApi
+    token, _ = get_hf_credentials()
+    files = HfApi(token=token).list_repo_files(repo_id=repo_id, repo_type="model")
+    ckpts = [f for f in files if f.startswith("checkpoints/") and f.endswith(".pt")
+             and "latest_patcher_" in f]
+
+    def step_of(f):
+        m = re.search(r"_gs(\d+)_", f)
+        return int(m.group(1)) if m else -1
+    return sorted(ckpts, key=step_of)
 
 
 def preflight(args):
@@ -213,32 +238,66 @@ def upload_folder_to_hf(local_dir, path_in_repo, commit_message):
         print(f"[watcher] HF folder upload failed: {e}", flush=True)
 
 
+def _next_checkpoint(args, done):
+    """
+    Return (local_path, score_name) for the newest not-yet-scored checkpoint,
+    or (None, None). HF source is the default and correct choice on Kaggle
+    (training only keeps one overwritten latest_patcher.pt locally; the distinct
+    gs-named files live on HF).
+    """
+    if args.checkpoint_source == "hf":
+        if not args.hf_repo:
+            print("[watcher] checkpoint_source=hf but no --hf_repo/$HF_REPO_ID set.", flush=True)
+            return None, None
+        remote = [f for f in hf_list_checkpoints(args.hf_repo)
+                  if os.path.basename(f) not in done]
+        if not remote:
+            return None, None
+        newest = remote[-1]                       # highest gs step, unscored
+        from huggingface_hub import hf_hub_download
+        token, _ = get_hf_credentials()
+        local = hf_hub_download(repo_id=args.hf_repo, filename=newest, repo_type="model",
+                                local_dir=args.hf_download_dir, token=token)
+        return local, os.path.basename(newest)
+    # local source
+    cands = sorted(glob.glob(os.path.join(args.checkpoints_dir, args.ckpt_glob)),
+                   key=os.path.getmtime)
+    todo = [c for c in cands if os.path.basename(c) not in done]
+    if not todo:
+        return None, None
+    return todo[-1], os.path.basename(todo[-1])
+
+
 def main():
     args = parse_args()
     os.chdir(REPO_ROOT)
     preflight(args)
-    print(f"[watcher] watching {args.checkpoints_dir} | benchmark {BENCHMARK_DETECTION:.0%} "
+    src_desc = (f"HF repo '{args.hf_repo}'" if args.checkpoint_source == "hf"
+                else f"local dir '{args.checkpoints_dir}'")
+    print(f"[watcher] source: {src_desc} | benchmark {BENCHMARK_DETECTION:.0%} "
           f"held-out detection | results -> {args.log_csv}", flush=True)
     while True:
         try:
             done = already_done(args.log_csv)
-            cands = sorted(glob.glob(os.path.join(args.checkpoints_dir, args.ckpt_glob)),
-                           key=os.path.getmtime)
-            todo = [c for c in cands if os.path.basename(c) not in done]
-            if todo:
-                newest = todo[-1]           # stay current; skip backlog
-                m = evaluate(args, newest)
+            ckpt_path, score_name = _next_checkpoint(args, done)
+            if ckpt_path:
+                print(f"[watcher] scoring {score_name} ...", flush=True)
+                m = evaluate(args, ckpt_path)
                 if m:
-                    ckpt_name = os.path.basename(newest)
-                    log_row(args, ckpt_name, m)
-                    
-                    # Upload updated CSV and individual checkpoint evaluation results to Hugging Face
-                    upload_to_hf(args.log_csv, "eval/eval_watcher_results.csv", f"update eval logs for {ckpt_name}")
-                    
-                    ckpt_id = os.path.splitext(ckpt_name)[0]
+                    log_row(args, score_name, m)
+                    upload_to_hf(args.log_csv, "eval/eval_watcher_results.csv",
+                                 f"update eval logs for {score_name}")
+                    ckpt_id = os.path.splitext(score_name)[0]
                     local_eval_dir = os.path.join("/kaggle/working/eval_watcher", ckpt_id)
                     if os.path.isdir(local_eval_dir):
-                        upload_folder_to_hf(local_eval_dir, f"eval/{ckpt_id}", f"upload eval metrics for {ckpt_name}")
+                        upload_folder_to_hf(local_eval_dir, f"eval/{ckpt_id}",
+                                            f"upload eval metrics for {score_name}")
+                # free disk: drop the downloaded checkpoint after scoring
+                if args.checkpoint_source == "hf" and os.path.exists(ckpt_path):
+                    try:
+                        os.remove(ckpt_path)
+                    except OSError:
+                        pass
             else:
                 print(f"[watcher] no new checkpoints ({len(done)} scored)", flush=True)
         except Exception as e:
