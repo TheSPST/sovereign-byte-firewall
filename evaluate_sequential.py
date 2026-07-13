@@ -71,9 +71,12 @@ def parse_args():
     p.add_argument("--cusum_k", type=float, default=0.5,
                    help="CUSUM slack in benign-sigma units; the test is optimal for "
                         "detecting a mean shift of 2k sigmas (default 0.5 => 1-sigma shifts)")
-    p.add_argument("--target_benign_alarms", type=float, default=1.0,
-                   help="False-alarm budget: alarms allowed on the ENTIRE held-out benign "
-                        "trace (default 1.0). h is chosen as the smallest threshold meeting this.")
+    p.add_argument("--target_alarms_per_10k", type=float, default=0.3,
+                   help="False-alarm budget as alarms per 10k benign windows (default 0.3, "
+                        "i.e. ~1 alarm per 33k windows). h is the smallest threshold whose "
+                        "alarm count on the CALIBRATION benign trace stays within this rate. "
+                        "The held-out benign trace is NEVER used for h selection — its alarm "
+                        "count is reported as the genuine held-out false-alarm measurement.")
     p.add_argument("--output_dir", type=str, default="results/sequential_eval")
     return p.parse_args()
 
@@ -179,22 +182,32 @@ def main():
     mu_b, sigma_b = float(np.mean(benign_cal)), float(np.std(benign_cal))
     print(f"  mu_b={mu_b:.3f} bits, sigma_b={sigma_b:.3f} bits over {len(benign_cal)} windows")
 
-    # --- Choose h on the HELD-OUT benign trace to meet the false-alarm budget ---
-    print(f"Scoring held-out benign (ordered): {args.benign_holdout_pcap}")
-    benign_hold = ordered_scores(model, args.benign_holdout_pcap, device, args, max_seq_len)
+    # --- Choose h on the CALIBRATION benign trace (no held-out leakage) ---
+    # FIX: an earlier version selected h on the held-out benign trace, which
+    # made the reported held-out false-alarm count partly in-sample. h is now
+    # fit entirely on calibration data; the held-out benign alarm count below
+    # is a genuine out-of-sample measurement.
+    cal_budget = args.target_alarms_per_10k * len(benign_cal) / 10000.0
     h_grid = np.linspace(1.0, 200.0, 400)
     chosen_h = None
     for h in h_grid:
-        n_alarms, _ = simulate_alarms(benign_hold, mu_b, sigma_b, args.cusum_k, h)
-        if n_alarms <= args.target_benign_alarms:
+        n_alarms, _ = simulate_alarms(benign_cal, mu_b, sigma_b, args.cusum_k, h)
+        if n_alarms <= cal_budget:
             chosen_h = float(h)
             break
     if chosen_h is None:
         chosen_h = float(h_grid[-1])
         print("WARNING: even the largest h in the grid exceeds the benign alarm budget.")
+    cal_alarms, _ = simulate_alarms(benign_cal, mu_b, sigma_b, args.cusum_k, chosen_h)
+    print(f"  chosen h={chosen_h:.2f} on calibration ({cal_alarms} alarm(s) / "
+          f"{len(benign_cal)} windows, budget {cal_budget:.2f})")
+
+    # --- Held-out benign: pure out-of-sample false-alarm measurement ---
+    print(f"Scoring held-out benign (ordered, UNTOUCHED by fitting): {args.benign_holdout_pcap}")
+    benign_hold = ordered_scores(model, args.benign_holdout_pcap, device, args, max_seq_len)
     benign_alarms, _ = simulate_alarms(benign_hold, mu_b, sigma_b, args.cusum_k, chosen_h)
-    print(f"  chosen h={chosen_h:.2f} -> {benign_alarms} alarm(s) over "
-          f"{len(benign_hold)} held-out benign windows")
+    print(f"  -> {benign_alarms} held-out benign alarm(s) over {len(benign_hold)} windows "
+          f"({10000.0 * benign_alarms / max(1, len(benign_hold)):.2f} per 10k windows)")
 
     # --- Attack traces ---
     exclude = {os.path.basename(args.benign_calibration_pcap),
@@ -235,9 +248,11 @@ def main():
         "score_agg": args.score_agg,
         "topk_frac": args.topk_frac,
         "complexity_correction": args.complexity_correction,
-        "cusum": {"k": args.cusum_k, "h": chosen_h, "mu_benign": mu_b, "sigma_benign": sigma_b},
+        "cusum": {"k": args.cusum_k, "h": chosen_h, "mu_benign": mu_b, "sigma_benign": sigma_b,
+                  "h_fit_on": "calibration", "calibration_alarms": cal_alarms,
+                  "target_alarms_per_10k": args.target_alarms_per_10k},
         "benign_holdout": {"windows": len(benign_hold), "alarms": benign_alarms,
-                           "budget": args.target_benign_alarms},
+                           "alarms_per_10k": 10000.0 * benign_alarms / max(1, len(benign_hold))},
         "trace_detection_rate": detected / max(1, evaluated),
         "per_file": per_file,
     }
