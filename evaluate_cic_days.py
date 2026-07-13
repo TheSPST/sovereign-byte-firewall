@@ -112,6 +112,11 @@ def parse_args():
                         "alarms inside interval+margin count as detections, and these regions "
                         "are excluded from false-alarm counting")
     p.add_argument("--output_dir", type=str, default="results/cic_day_eval")
+    p.add_argument("--window_subsample", type=int, default=1,
+                   help="Score only 1 of every N windows (default 1 = all). The byte "
+                        "stream still advances over every window so masking stays correct; "
+                        "only model inference is reduced ~Nx. CUSUM catches sustained "
+                        "attack periods fine at N=20 on dense captures like CIC Wednesday.")
     p.add_argument("--stop_after_minutes", type=float, default=None,
                    help="Stop streaming this many minutes of CAPTURE time after the first "
                         "packet (timezone-independent, fast partial run). Wednesday's 4 DoS "
@@ -156,12 +161,19 @@ def _packet_epoch(meta):
     return float(sec) + float(usec) / 1e6
 
 
-def stream_window_scores(model, device, pcap_path, seq_len, batch_size, agg, topk_frac):
+def stream_window_scores(model, device, pcap_path, seq_len, batch_size, agg, topk_frac,
+                         subsample=1):
     """
-    Stream the pcap in order; yield (score, capture_epoch_ts) per 512-byte
+    Stream the pcap in order; yield (score, capture_epoch_ts) per scored
     window. Uses the SAME masking as training (RawPcapIterableDataset's
     parser, with cross-packet TLS state) but tracks byte-offset->timestamp
     marks so every window gets the capture time of its first byte.
+
+    subsample: score only 1 of every `subsample` windows (default 1 = all).
+    The byte stream still advances over every window (masking state stays
+    correct), but the expensive model inference runs on 1/subsample of them.
+    CUSUM detects SUSTAINED shifts over an attack period, so coarse sampling
+    (e.g. 20) still catches multi-minute attacks at ~20x the speed.
     """
     # Borrow the masking method without paying dataset __init__ (hashing etc.)
     masker = RawPcapIterableDataset.__new__(RawPcapIterableDataset)
@@ -174,6 +186,7 @@ def stream_window_scores(model, device, pcap_path, seq_len, batch_size, agg, top
     marks_off, marks_ts = [], []   # byte offset of each packet start (in buffer coords), its ts
     consumed = 0                   # bytes already cut into windows (global coords)
     pending = []                   # [(window_bytes, ts)]
+    win_counter = 0                # global window index (for subsampling)
 
     @torch.no_grad()
     def flush(force=False):
@@ -209,10 +222,13 @@ def stream_window_scores(model, device, pcap_path, seq_len, batch_size, agg, top
             global_off += len(masked)
 
             while len(buffer) >= seq_len:
-                w = bytes(buffer[:seq_len])
-                # timestamp of the packet containing this window's first byte
-                i = bisect.bisect_right(marks_off, consumed) - 1
-                pending.append((w, marks_ts[max(0, i)]))
+                # Only score 1 of every `subsample` windows; skipped windows
+                # still advance the buffer (masking state stays sequential).
+                if win_counter % subsample == 0:
+                    w = bytes(buffer[:seq_len])
+                    i = bisect.bisect_right(marks_off, consumed) - 1
+                    pending.append((w, marks_ts[max(0, i)]))
+                win_counter += 1
                 del buffer[:seq_len]
                 consumed += seq_len
             # prune old marks
@@ -250,7 +266,8 @@ def main():
     scores, tss = [], []
     n = 0
     for s, t in stream_window_scores(model, device, args.pcap, seq_len,
-                                     args.batch_size, args.score_agg, args.topk_frac):
+                                     args.batch_size, args.score_agg, args.topk_frac,
+                                     subsample=args.window_subsample):
         if t_start is None:
             t_start = t
             print(f"First packet capture time: {_local(t):%Y-%m-%d %H:%M:%S} "
