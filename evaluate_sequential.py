@@ -71,6 +71,14 @@ def parse_args():
     p.add_argument("--cusum_k", type=float, default=0.5,
                    help="CUSUM slack in benign-sigma units; the test is optimal for "
                         "detecting a mean shift of 2k sigmas (default 0.5 => 1-sigma shifts)")
+    p.add_argument("--benign_fit_source", type=str, default="calibration",
+                   choices=["calibration", "holdout_split"],
+                   help="Where mu/sigma and h are fit. 'calibration' (default): the "
+                        "calibration benign trace. 'holdout_split': the FIRST half of "
+                        "the held-out benign trace, with false alarms measured on the "
+                        "SECOND half only — use this to test whether a dirty calibration "
+                        "trace (sustained anomalous segments forcing h to saturate) is "
+                        "the bottleneck rather than the model.")
     p.add_argument("--target_alarms_per_10k", type=float, default=0.3,
                    help="False-alarm budget as alarms per 10k benign windows (default 0.3, "
                         "i.e. ~1 alarm per 33k windows). h is the smallest threshold whose "
@@ -147,17 +155,15 @@ def cusum_path(scores, mu, sigma, k):
 
 
 def simulate_alarms(scores, mu, sigma, k, h):
-    """CUSUM with reset after each alarm: (num_alarms, first_alarm_index)."""
-    c, count, first = 0.0, 0, None
+    """CUSUM with reset after each alarm: (num_alarms, first_alarm_index, all_indices)."""
+    c, indices = 0.0, []
     inv_sigma = 1.0 / max(sigma, 1e-9)
     for i, s in enumerate(scores):
         c = max(0.0, c + (s - mu) * inv_sigma - k)
         if c > h:
-            count += 1
-            if first is None:
-                first = i
+            indices.append(i)
             c = 0.0  # reset and keep monitoring
-    return count, first
+    return len(indices), (indices[0] if indices else None), indices
 
 
 def main():
@@ -173,39 +179,52 @@ def main():
 
     model, max_seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
 
-    # --- Benign reference distribution (calibration file, ordered) ---
-    print(f"\nScoring benign calibration (ordered): {args.benign_calibration_pcap}")
-    benign_cal = ordered_scores(model, args.benign_calibration_pcap, device, args, max_seq_len)
-    if len(benign_cal) < 100:
-        print("ERROR: not enough benign calibration windows.", file=sys.stderr)
-        sys.exit(1)
-    mu_b, sigma_b = float(np.mean(benign_cal)), float(np.std(benign_cal))
-    print(f"  mu_b={mu_b:.3f} bits, sigma_b={sigma_b:.3f} bits over {len(benign_cal)} windows")
+    # --- Benign fit set / held-out set (no leakage in either mode) ---
+    if args.benign_fit_source == "holdout_split":
+        # Diagnostic mode: normal.pcap's sustained anomalous segments can force
+        # h to saturate; fit on the first half of the held-out trace instead and
+        # measure false alarms on the second half only.
+        print(f"\nScoring held-out benign (ordered), split 50/50 fit/test: {args.benign_holdout_pcap}")
+        hold_all = ordered_scores(model, args.benign_holdout_pcap, device, args, max_seq_len)
+        mid = len(hold_all) // 2
+        benign_fit, benign_hold = hold_all[:mid], hold_all[mid:]
+        fit_label = f"{args.benign_holdout_pcap} [first half]"
+    else:
+        print(f"\nScoring benign calibration (ordered): {args.benign_calibration_pcap}")
+        benign_fit = ordered_scores(model, args.benign_calibration_pcap, device, args, max_seq_len)
+        print(f"Scoring held-out benign (ordered, UNTOUCHED by fitting): {args.benign_holdout_pcap}")
+        benign_hold = ordered_scores(model, args.benign_holdout_pcap, device, args, max_seq_len)
+        fit_label = args.benign_calibration_pcap
 
-    # --- Choose h on the CALIBRATION benign trace (no held-out leakage) ---
-    # FIX: an earlier version selected h on the held-out benign trace, which
-    # made the reported held-out false-alarm count partly in-sample. h is now
-    # fit entirely on calibration data; the held-out benign alarm count below
-    # is a genuine out-of-sample measurement.
-    cal_budget = args.target_alarms_per_10k * len(benign_cal) / 10000.0
-    h_grid = np.linspace(1.0, 200.0, 400)
+    if len(benign_fit) < 100:
+        print("ERROR: not enough benign fit windows.", file=sys.stderr)
+        sys.exit(1)
+    mu_b, sigma_b = float(np.mean(benign_fit)), float(np.std(benign_fit))
+    print(f"  mu_b={mu_b:.3f} bits, sigma_b={sigma_b:.3f} bits over {len(benign_fit)} "
+          f"fit windows ({fit_label})")
+
+    # --- Choose h on the fit set only ---
+    fit_budget = args.target_alarms_per_10k * len(benign_fit) / 10000.0
+    h_grid = np.geomspace(1.0, 5000.0, 800)
     chosen_h = None
     for h in h_grid:
-        n_alarms, _ = simulate_alarms(benign_cal, mu_b, sigma_b, args.cusum_k, h)
-        if n_alarms <= cal_budget:
+        n_alarms, _, _ = simulate_alarms(benign_fit, mu_b, sigma_b, args.cusum_k, h)
+        if n_alarms <= fit_budget:
             chosen_h = float(h)
             break
     if chosen_h is None:
         chosen_h = float(h_grid[-1])
         print("WARNING: even the largest h in the grid exceeds the benign alarm budget.")
-    cal_alarms, _ = simulate_alarms(benign_cal, mu_b, sigma_b, args.cusum_k, chosen_h)
-    print(f"  chosen h={chosen_h:.2f} on calibration ({cal_alarms} alarm(s) / "
-          f"{len(benign_cal)} windows, budget {cal_budget:.2f})")
+    fit_alarms, _, fit_alarm_idx = simulate_alarms(benign_fit, mu_b, sigma_b, args.cusum_k, chosen_h)
+    print(f"  chosen h={chosen_h:.2f} on fit set ({fit_alarms} alarm(s) / "
+          f"{len(benign_fit)} windows, budget {fit_budget:.2f})")
+    if fit_alarm_idx:
+        # Approximate location of each offending benign segment, as a fraction
+        # of the trace — multiply by capture duration to find it in Wireshark.
+        fracs = [round(i / len(benign_fit), 3) for i in fit_alarm_idx]
+        print(f"  fit-set alarm positions (fraction through trace): {fracs}")
 
-    # --- Held-out benign: pure out-of-sample false-alarm measurement ---
-    print(f"Scoring held-out benign (ordered, UNTOUCHED by fitting): {args.benign_holdout_pcap}")
-    benign_hold = ordered_scores(model, args.benign_holdout_pcap, device, args, max_seq_len)
-    benign_alarms, _ = simulate_alarms(benign_hold, mu_b, sigma_b, args.cusum_k, chosen_h)
+    benign_alarms, _, hold_alarm_idx = simulate_alarms(benign_hold, mu_b, sigma_b, args.cusum_k, chosen_h)
     print(f"  -> {benign_alarms} held-out benign alarm(s) over {len(benign_hold)} windows "
           f"({10000.0 * benign_alarms / max(1, len(benign_hold)):.2f} per 10k windows)")
 
@@ -224,7 +243,7 @@ def main():
         if not s:
             continue
         evaluated += 1
-        n_alarms, first = simulate_alarms(s, mu_b, sigma_b, args.cusum_k, chosen_h)
+        n_alarms, first, _ = simulate_alarms(s, mu_b, sigma_b, args.cusum_k, chosen_h)
         hit = n_alarms > 0
         detected += int(hit)
         per_file[name] = {
@@ -249,9 +268,12 @@ def main():
         "topk_frac": args.topk_frac,
         "complexity_correction": args.complexity_correction,
         "cusum": {"k": args.cusum_k, "h": chosen_h, "mu_benign": mu_b, "sigma_benign": sigma_b,
-                  "h_fit_on": "calibration", "calibration_alarms": cal_alarms,
+                  "benign_fit_source": args.benign_fit_source,
+                  "fit_windows": len(benign_fit), "fit_alarms": fit_alarms,
+                  "fit_alarm_indices": fit_alarm_idx,
                   "target_alarms_per_10k": args.target_alarms_per_10k},
         "benign_holdout": {"windows": len(benign_hold), "alarms": benign_alarms,
+                           "alarm_indices": hold_alarm_idx,
                            "alarms_per_10k": 10000.0 * benign_alarms / max(1, len(benign_hold))},
         "trace_detection_rate": detected / max(1, evaluated),
         "per_file": per_file,
