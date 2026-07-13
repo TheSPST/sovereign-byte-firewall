@@ -132,6 +132,30 @@ def load_schedule(args):
     return CIC_SCHEDULES[args.day]
 
 
+def _packet_epoch(meta):
+    """
+    Capture time (epoch seconds, float) from a scapy pcap-reader metadata object,
+    handling BOTH formats:
+      * pcapng (PacketMetadataNg): tshigh/tslow/tsresol
+          epoch = (tshigh << 32 | tslow) / tsresol
+        (CIC-IDS2017 re-hosts like bvsam/cic-ids-2017 are pcapng — magic 0a0d0d0a)
+      * classic pcap (PacketMetadata): sec + usec/1e6
+    Returns 0.0 only if nothing usable is present.
+    """
+    tshigh = getattr(meta, "tshigh", None)
+    tslow = getattr(meta, "tslow", None)
+    if tshigh is not None and tslow is not None:
+        tsresol = getattr(meta, "tsresol", 1000000) or 1000000
+        return ((int(tshigh) << 32) | int(tslow)) / float(tsresol)
+    sec = getattr(meta, "sec", None)
+    if sec is None and isinstance(meta, tuple) and meta:
+        sec = meta[0]
+    if sec is None:
+        return 0.0
+    usec = getattr(meta, "usec", 0) or 0
+    return float(sec) + float(usec) / 1e6
+
+
 def stream_window_scores(model, device, pcap_path, seq_len, batch_size, agg, topk_frac):
     """
     Stream the pcap in order; yield (score, capture_epoch_ts) per 512-byte
@@ -176,11 +200,7 @@ def stream_window_scores(model, device, pcap_path, seq_len, batch_size, agg, top
     with RawPcapReader(fobj) as reader:
         global_off = 0
         for packet_data, meta in reader:
-            ts = getattr(meta, "sec", None)
-            if ts is None and isinstance(meta, tuple):
-                ts = meta[0]
-            usec = getattr(meta, "usec", 0) or 0
-            ts = float(ts) + float(usec) / 1e6 if ts is not None else 0.0
+            ts = _packet_epoch(meta)
 
             masked = masker._mask_packet_addresses(packet_data, stream_tls_state=tls_state)
             marks_off.append(global_off)
