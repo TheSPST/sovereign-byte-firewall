@@ -127,6 +127,14 @@ def parse_args():
              "estimate on first pass; pass the known window count for an exact schedule)"
     )
     parser.add_argument(
+        "--max_lr",
+        type=float,
+        default=1e-4,
+        help="OneCycleLR PEAK learning rate (default 1e-4). The old hardcoded 5e-4 "
+             "was diagnosed too high: held-out detection peaked during warmup then "
+             "collapsed to random as sustained high LR wrecked the tiny model."
+    )
+    parser.add_argument(
         "--allow_resume",
         action="store_true",
         default=False,
@@ -315,7 +323,8 @@ def main():
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
         val_dataloader=val_dataloader,
-        total_steps_override=args.total_steps
+        total_steps_override=args.total_steps,
+        max_lr=args.max_lr
     )
     print("\nKaggle training script finished successfully!")
 
