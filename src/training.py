@@ -118,7 +118,7 @@ def evaluate_validation_loss(model, val_dataloader, criterion, use_focal_loss, a
     return total_loss / steps
 
 
-def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000, val_dataloader=None, total_steps_override=None):
+def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000, val_dataloader=None, total_steps_override=None, max_lr=5e-4):
     """
     Unified training loop for Kaggle (T4/P100) and AI Kosh (A100).
     Powered by Hugging Face Accelerate for maximum multi-GPU throughput.
@@ -172,9 +172,16 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                   f"LR collapse. Pass total_steps_override for an exact schedule.")
         else:
             print(f"[SCHEDULER] OneCycleLR total_steps={total_steps} (from cached manifest count).")
+    # max_lr is the OneCycleLR PEAK learning rate. Diagnosis 2026-07-13: the
+    # default 5e-4 is too high for this tiny 2-layer model — held-out
+    # discrimination peaked DURING warmup (~gs75k, before the LR peak at ~gs84k)
+    # then progressively collapsed to random (AUC~0.5) as sustained high LR
+    # after the peak wrecked the learned weights. Lower this (e.g. 1e-4) for a
+    # stable run that keeps improving past warmup instead of degrading.
+    print(f"[SCHEDULER] OneCycleLR max_lr={max_lr}")
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=5e-4,
+        max_lr=max_lr,
         total_steps=total_steps,
         pct_start=0.1,
         anneal_strategy='cos',
