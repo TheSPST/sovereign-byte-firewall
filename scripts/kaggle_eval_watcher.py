@@ -137,6 +137,58 @@ def log_row(args, name, m):
           f"-> {verdict}", flush=True)
 
 
+def get_hf_credentials():
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if not token:
+        try:
+            from huggingface_hub import HfFolder
+            token = HfFolder.get_token() or ""
+        except Exception:
+            pass
+    repo_id = os.environ.get("HF_REPO_ID", "").strip()
+    return token, repo_id
+
+
+def upload_to_hf(local_path, path_in_repo, commit_message):
+    token, repo_id = get_hf_credentials()
+    if not token or not repo_id:
+        return
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message
+        )
+        print(f"[watcher] ✓ Uploaded '{local_path}' to HF Hub '{repo_id}/{path_in_repo}'", flush=True)
+    except Exception as e:
+        print(f"[watcher] HF upload failed: {e}", flush=True)
+
+
+def upload_folder_to_hf(local_dir, path_in_repo, commit_message):
+    token, repo_id = get_hf_credentials()
+    if not token or not repo_id:
+        return
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
+        api.upload_folder(
+            folder_path=local_dir,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message
+        )
+        print(f"[watcher] ✓ Uploaded folder '{local_dir}' to HF Hub '{repo_id}/{path_in_repo}'", flush=True)
+    except Exception as e:
+        print(f"[watcher] HF folder upload failed: {e}", flush=True)
+
+
 def main():
     args = parse_args()
     os.chdir(REPO_ROOT)
@@ -153,7 +205,16 @@ def main():
                 newest = todo[-1]           # stay current; skip backlog
                 m = evaluate(args, newest)
                 if m:
-                    log_row(args, os.path.basename(newest), m)
+                    ckpt_name = os.path.basename(newest)
+                    log_row(args, ckpt_name, m)
+                    
+                    # Upload updated CSV and individual checkpoint evaluation results to Hugging Face
+                    upload_to_hf(args.log_csv, "eval/eval_watcher_results.csv", f"update eval logs for {ckpt_name}")
+                    
+                    ckpt_id = os.path.splitext(ckpt_name)[0]
+                    local_eval_dir = os.path.join("/kaggle/working/eval_watcher", ckpt_id)
+                    if os.path.isdir(local_eval_dir):
+                        upload_folder_to_hf(local_eval_dir, f"eval/{ckpt_id}", f"upload eval metrics for {ckpt_name}")
             else:
                 print(f"[watcher] no new checkpoints ({len(done)} scored)", flush=True)
         except Exception as e:
