@@ -67,16 +67,37 @@ def parse_args():
 
 
 def preflight(args):
-    need = [args.benign_calibration, args.benign_holdout, args.holdout_attack]
-    missing = [f for f in need if not os.path.exists(os.path.join(args.eval_data_dir, f))]
-    if not os.path.isdir(args.eval_data_dir) or missing:
-        print(f"[watcher] eval data unavailable in '{args.eval_data_dir}'. "
-              f"Missing: {missing or 'directory not found'}.\n"
-              f"[watcher] Attach the scratch pcaps as a Kaggle dataset and pass "
-              f"--eval_data_dir. Exiting (training is unaffected).", flush=True)
+    # Always log what's actually in the eval dir — makes filename mismatches
+    # self-diagnosing from the log instead of a silent exit.
+    if not os.path.isdir(args.eval_data_dir):
+        print(f"[watcher] eval_data_dir '{args.eval_data_dir}' does not exist. "
+              f"Exiting (training is unaffected).", flush=True)
         sys.exit(0)
-    n_attack = len([f for f in glob.glob(os.path.join(args.eval_data_dir, "*.pcap"))
-                    if os.path.basename(f) not in need])
+    present = sorted(os.path.basename(f) for f in glob.glob(os.path.join(args.eval_data_dir, "*.pcap")))
+    print(f"[watcher] eval_data_dir '{args.eval_data_dir}' contains {len(present)} pcap(s): "
+          f"{present}", flush=True)
+
+    # Hard requirements: a benign calibration file and a held-out attack file.
+    # The benign HOLDOUT is optional — if absent we reuse the calibration file
+    # (the held-out FPR becomes in-sample, noted in the log, but the detection
+    # number the watcher tracks is unaffected).
+    hard = {"benign_calibration": args.benign_calibration, "holdout_attack": args.holdout_attack}
+    missing_hard = {k: v for k, v in hard.items() if not os.path.exists(os.path.join(args.eval_data_dir, v))}
+    if missing_hard:
+        print(f"[watcher] MISSING required eval files {missing_hard} in '{args.eval_data_dir}'. "
+              f"Available: {present}. Re-launch with --benign_calibration / --holdout_attack "
+              f"set to real filenames from the list above. Exiting (training is unaffected).",
+              flush=True)
+        sys.exit(0)
+
+    if not os.path.exists(os.path.join(args.eval_data_dir, args.benign_holdout)):
+        print(f"[watcher] NOTE: benign holdout '{args.benign_holdout}' absent — reusing "
+              f"'{args.benign_calibration}' for the held-out FPR check (in-sample; detection "
+              f"metric unaffected).", flush=True)
+        args.benign_holdout = args.benign_calibration
+
+    need = {args.benign_calibration, args.benign_holdout, args.holdout_attack}
+    n_attack = len([f for f in present if f not in need])
     print(f"[watcher] eval data OK: {n_attack} calibration attack pcaps + held-out set", flush=True)
 
 
