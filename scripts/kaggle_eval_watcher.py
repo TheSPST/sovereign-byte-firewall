@@ -73,6 +73,10 @@ def parse_args():
                    help="HF repo to pull checkpoints from (default: $HF_REPO_ID)")
     p.add_argument("--hf_download_dir", default="/kaggle/working/hf_ckpt_eval",
                    help="Where to stage checkpoints downloaded from HF for scoring")
+    p.add_argument("--output_root", default="/kaggle/working/eval_watcher",
+                   help="Where per-checkpoint eval artifacts (metrics.json, plots) are "
+                        "written. Set this to a local path when running OFF Kaggle "
+                        "(e.g. on your Mac): --output_root ./eval_out")
     return p.parse_args()
 
 
@@ -147,7 +151,7 @@ def max_scored_step(done):
 
 def evaluate(args, ckpt_path):
     name = os.path.basename(ckpt_path)
-    out_dir = os.path.join("/kaggle/working/eval_watcher", os.path.splitext(name)[0])
+    out_dir = os.path.join(args.output_root, os.path.splitext(name)[0])
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")   # CPU only — no GPU contention
     cmd = [
         sys.executable, "evaluate_zero_day.py",
@@ -304,7 +308,7 @@ def main():
                     upload_to_hf(args.log_csv, "eval/eval_watcher_results.csv",
                                  f"update eval logs for {score_name}")
                     ckpt_id = os.path.splitext(score_name)[0]
-                    local_eval_dir = os.path.join("/kaggle/working/eval_watcher", ckpt_id)
+                    local_eval_dir = os.path.join(args.output_root, ckpt_id)
                     if os.path.isdir(local_eval_dir):
                         upload_folder_to_hf(local_eval_dir, f"eval/{ckpt_id}",
                                             f"upload eval metrics for {score_name}")
