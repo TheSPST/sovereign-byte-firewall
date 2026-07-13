@@ -126,11 +126,23 @@ def preflight(args):
     print(f"[watcher] eval data OK: {n_attack} calibration attack pcaps + held-out set", flush=True)
 
 
+def _step_of(name):
+    """Parse the gs training step out of a checkpoint filename (-1 if absent)."""
+    import re
+    m = re.search(r"_gs(\d+)_", name)
+    return int(m.group(1)) if m else -1
+
+
 def already_done(log_csv):
     if not os.path.exists(log_csv):
         return set()
     with open(log_csv, newline="") as f:
         return {r["checkpoint"] for r in csv.DictReader(f)}
+
+
+def max_scored_step(done):
+    """Highest gs step already scored — the 'start from the latest' high-water mark."""
+    return max((_step_of(n) for n in done), default=-1)
 
 
 def evaluate(args, ckpt_path):
@@ -245,15 +257,18 @@ def _next_checkpoint(args, done):
     (training only keeps one overwritten latest_patcher.pt locally; the distinct
     gs-named files live on HF).
     """
+    hwm = max_scored_step(done)   # only ever move FORWARD from the latest scored step
     if args.checkpoint_source == "hf":
         if not args.hf_repo:
             print("[watcher] checkpoint_source=hf but no --hf_repo/$HF_REPO_ID set.", flush=True)
             return None, None
+        # Candidates strictly newer than the high-water mark and not already scored.
         remote = [f for f in hf_list_checkpoints(args.hf_repo)
-                  if os.path.basename(f) not in done]
+                  if _step_of(os.path.basename(f)) > hwm
+                  and os.path.basename(f) not in done]
         if not remote:
             return None, None
-        newest = remote[-1]                       # highest gs step, unscored
+        newest = remote[-1]                       # highest gs step available
         from huggingface_hub import hf_hub_download
         token, _ = get_hf_credentials()
         local = hf_hub_download(repo_id=args.hf_repo, filename=newest, repo_type="model",
@@ -262,7 +277,8 @@ def _next_checkpoint(args, done):
     # local source
     cands = sorted(glob.glob(os.path.join(args.checkpoints_dir, args.ckpt_glob)),
                    key=os.path.getmtime)
-    todo = [c for c in cands if os.path.basename(c) not in done]
+    todo = [c for c in cands if _step_of(os.path.basename(c)) > hwm
+            and os.path.basename(c) not in done]
     if not todo:
         return None, None
     return todo[-1], os.path.basename(todo[-1])
