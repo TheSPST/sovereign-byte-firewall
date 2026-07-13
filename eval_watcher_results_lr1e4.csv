@@ -1,0 +1,4 @@
+timestamp,checkpoint,calib_auc,holdout_detection,holdout_fpr,benign_sigma_proxy
+2026-07-13T20:25:14,latest_patcher_ep0_gs40000_mid_epoch.pt,0.942,0.0549392498679345,0.015744793349587286,6.701
+2026-07-13T20:33:46,latest_patcher_ep0_gs70000_mid_epoch.pt,0.9132,0.08491811938721607,0.04227007020532855,6.958
+2026-07-13T20:42:35,latest_patcher_ep0_gs95000_mid_epoch.pt,0.5634,1.0,0.983667714361249,8.073

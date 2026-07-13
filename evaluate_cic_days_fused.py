@@ -86,38 +86,47 @@ def _local(ts, off):
 # Rate detector: one cheap pass counting bare-SYNs per time bucket per source.
 # ---------------------------------------------------------------------------
 def rate_scores_over_time(pcap_path, window_sec, stop_epoch=None):
-    """
-    Returns (bucket_start_epochs, scores): for each fixed-width time bucket,
-    the max number of bare-SYN packets (SYN set, ACK clear) from any single
-    source IP. Timestamps decoded pcapng-correctly via _packet_epoch.
-    """
     import gzip
+    import dpkt
     from collections import defaultdict
+    
     fobj = gzip.open(pcap_path, "rb") if pcap_path.endswith(".gz") else open(pcap_path, "rb")
-    buckets = {}                 # bucket_idx -> {src_ip: count}
+    buckets = {}
     first_ts = None
-    with RawPcapReader(fobj) as reader:
-        for packet_data, meta in reader:
-            ts = _packet_epoch(meta)
-            if first_ts is None:
-                first_ts = ts
-            if stop_epoch is not None and ts > stop_epoch:
-                break
-            try:
-                pkt = Ether(packet_data)
-                if not pkt.haslayer(TCP) or not pkt.haslayer(IP):
-                    continue
-                flags = int(pkt[TCP].flags)
-                if not (bool(flags & 0x02) and not bool(flags & 0x10)):  # bare SYN
-                    continue
-                src = pkt[IP].src
-            except Exception:
+    
+    try:
+        reader = dpkt.pcap.Reader(fobj)
+    except ValueError:
+        fobj.seek(0)
+        reader = dpkt.pcapng.Reader(fobj)
+        
+    for ts, packet_data in reader:
+        if first_ts is None:
+            first_ts = ts
+        if stop_epoch is not None and ts > stop_epoch:
+            break
+            
+        try:
+            eth = dpkt.ethernet.Ethernet(packet_data)
+            if not isinstance(eth.data, dpkt.ip.IP): continue
+            ip = eth.data
+            if not isinstance(ip.data, dpkt.tcp.TCP): continue
+            tcp = ip.data
+            
+            if not (bool(tcp.flags & dpkt.tcp.TH_SYN) and not bool(tcp.flags & dpkt.tcp.TH_ACK)):
                 continue
-            b = int((ts - first_ts) // window_sec)
-            buckets.setdefault(b, defaultdict(int))[src] += 1
+            src = ip.src
+        except Exception:
+            continue
+            
+        b = int((ts - first_ts) // window_sec)
+        buckets.setdefault(b, defaultdict(int))[src] += 1
+        
     fobj.close()
+    
     if not buckets:
         return np.array([]), np.array([])
+        
     idxs = sorted(buckets)
     epochs = np.array([first_ts + b * window_sec for b in idxs], dtype=float)
     scores = np.array([max(buckets[b].values()) for b in idxs], dtype=float)
