@@ -1,0 +1,94 @@
+{
+  "checkpoint_path": "checkpoints/latest_patcher_ep0_gs50000_mid_epoch.pt",
+  "max_sequence_length": 512,
+  "score_agg": "topk",
+  "topk_frac": 0.1,
+  "calibration": {
+    "benign_file": "scratch/archive_upload/normal.pcap",
+    "attack_files": [
+      "blackEnergy.pcap",
+      "distcc_exec_backdoor.pcap",
+      "distcc_exec_backdoor2.pcap",
+      "hydra_ftp.pcap",
+      "hydra_ftp2.pcap",
+      "hydra_ssh.pcap",
+      "hydra_ssh2.pcap",
+      "java_rmi.pcap",
+      "java_rmi2.pcap",
+      "mirai.pcap",
+      "netbios_ssn.pcap",
+      "netbios_ssn2.pcap",
+      "replayAttacks.pcap",
+      "ruby_drb.pcap",
+      "ruby_drb2.pcap",
+      "smtp.pcap",
+      "smtp22.pcap",
+      "tomcat.pcap",
+      "tomcat2.pcap",
+      "unreallrcd.pcap",
+      "unreallrcd2.pcap",
+      "vsftpd.pcap",
+      "vsftpd2.pcap",
+      "zeus.pcap"
+    ],
+    "num_benign_windows": 13614,
+    "num_attack_windows": 314411,
+    "auc": 0.5614197578579634,
+    "youden": {
+      "threshold": 9.210077285766602,
+      "tpr": 0.9696798140014186,
+      "fpr": 0.6746731306008521
+    },
+    "target_fpr": {
+      "requested": 0.01,
+      "threshold": 12.430651664733887,
+      "tpr": 0.011449981075725722,
+      "fpr": 0.009989716468341413
+    },
+    "per_file_mean_score": {
+      "benign_calibration": 9.839442884246035,
+      "blackEnergy.pcap": 10.353025881798713,
+      "distcc_exec_backdoor.pcap": 10.688726400074206,
+      "distcc_exec_backdoor2.pcap": 10.688726400074206,
+      "hydra_ftp.pcap": 11.465424014730068,
+      "hydra_ftp2.pcap": 11.465424014730068,
+      "hydra_ssh.pcap": 11.24569491289872,
+      "hydra_ssh2.pcap": 11.245696895588928,
+      "java_rmi.pcap": 12.155266536562445,
+      "java_rmi2.pcap": 12.154804777483003,
+      "mirai.pcap": 10.619830787176609,
+      "netbios_ssn.pcap": 10.585017903318478,
+      "netbios_ssn2.pcap": 10.58501971206224,
+      "replayAttacks.pcap": 9.47051091618528,
+      "ruby_drb.pcap": 10.55491155710405,
+      "ruby_drb2.pcap": 10.55491155710405,
+      "smtp.pcap": 11.662469451949441,
+      "smtp22.pcap": 11.661651255816398,
+      "tomcat.pcap": 9.582817611815054,
+      "tomcat2.pcap": 9.582817611815054,
+      "unreallrcd.pcap": 10.743401143193733,
+      "unreallrcd2.pcap": 10.743621752993635,
+      "vsftpd.pcap": 10.63295192751035,
+      "vsftpd2.pcap": 10.63295192751035,
+      "zeus.pcap": 9.0644990041852
+    }
+  },
+  "holdout": {
+    "benign_file": "scratch/archive_upload/normal2.pcap",
+    "attack_file": "scratch/archive_upload/0day.pcap",
+    "num_benign_windows": 34043,
+    "num_attack_windows": 7572,
+    "results": {
+      "youden": {
+        "threshold": 9.210077285766602,
+        "holdout_benign_false_positive_rate": 0.23831624709925683,
+        "holdout_attack_detection_rate": 0.3810089804543053
+      },
+      "target_fpr": {
+        "threshold": 12.430651664733887,
+        "holdout_benign_false_positive_rate": 2.9374614458185237e-05,
+        "holdout_attack_detection_rate": 0.0
+      }
+    }
+  }
+}

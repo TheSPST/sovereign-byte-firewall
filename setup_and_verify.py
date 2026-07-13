@@ -55,6 +55,16 @@ def verify_system(args):
         print("To run local debug mode on macOS/CPU, please pass the '--bypass_cuda_check' flag.", file=sys.stderr)
         raise RuntimeError("Production training requires an NVIDIA GPU with CUDA.")
         
+    if cuda_available:
+        # Check GPU compute capability to avoid CUDA error: no kernel image is available
+        major, minor = torch.cuda.get_device_capability(0)
+        if major < 7:
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"ERROR: Detected GPU '{gpu_name}' with CUDA capability {major}.{minor}.", file=sys.stderr)
+            print("The installed PyTorch version requires CUDA capability >= 7.0 (sm_70+).", file=sys.stderr)
+            print("Tesla P100 (sm_60) is NOT compatible. Please use a newer GPU (like T4, A100, V100).", file=sys.stderr)
+            raise RuntimeError("Unsupported GPU architecture (compute capability < 7.0).")
+        
     # 3. Print System Report
     print(f"CUDA Available:   {cuda_available}")
     if cuda_available:

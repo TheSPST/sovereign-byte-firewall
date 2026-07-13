@@ -1,0 +1,182 @@
+{
+  "checkpoint_path": "checkpoints/latest_patcher_ep0_gs865000_mid_epoch.pt",
+  "score_agg": "topk",
+  "topk_frac": 0.1,
+  "complexity_correction": "none",
+  "cusum": {
+    "k": 0.5,
+    "h": 32.997101792734355,
+    "mu_benign": 8.437467621232612,
+    "sigma_benign": 1.2201330372320598,
+    "benign_fit_source": "holdout_split",
+    "fit_windows": 17021,
+    "fit_alarms": 0,
+    "fit_alarm_indices": [],
+    "target_alarms_per_10k": 0.3
+  },
+  "benign_holdout": {
+    "windows": 17022,
+    "alarms": 5,
+    "alarm_indices": [
+      8530,
+      8538,
+      8546,
+      8554,
+      8562
+    ],
+    "alarms_per_10k": 2.937375161555634
+  },
+  "trace_detection_rate": 1.0,
+  "per_file": {
+    "0day.pcap": {
+      "windows": 7572,
+      "alarms": 252,
+      "first_alarm_window": 103,
+      "detected": true
+    },
+    "blackEnergy.pcap": {
+      "windows": 182,
+      "alarms": 23,
+      "first_alarm_window": 8,
+      "detected": true
+    },
+    "distcc_exec_backdoor.pcap": {
+      "windows": 19,
+      "alarms": 2,
+      "first_alarm_window": 8,
+      "detected": true
+    },
+    "distcc_exec_backdoor2.pcap": {
+      "windows": 19,
+      "alarms": 2,
+      "first_alarm_window": 8,
+      "detected": true
+    },
+    "hydra_ftp.pcap": {
+      "windows": 569,
+      "alarms": 62,
+      "first_alarm_window": 9,
+      "detected": true
+    },
+    "hydra_ftp2.pcap": {
+      "windows": 569,
+      "alarms": 62,
+      "first_alarm_window": 9,
+      "detected": true
+    },
+    "hydra_ssh.pcap": {
+      "windows": 2924,
+      "alarms": 324,
+      "first_alarm_window": 15,
+      "detected": true
+    },
+    "hydra_ssh2.pcap": {
+      "windows": 2924,
+      "alarms": 324,
+      "first_alarm_window": 15,
+      "detected": true
+    },
+    "java_rmi.pcap": {
+      "windows": 5689,
+      "alarms": 416,
+      "first_alarm_window": 26,
+      "detected": true
+    },
+    "java_rmi2.pcap": {
+      "windows": 5689,
+      "alarms": 416,
+      "first_alarm_window": 26,
+      "detected": true
+    },
+    "mirai.pcap": {
+      "windows": 147711,
+      "alarms": 23555,
+      "first_alarm_window": 7,
+      "detected": true
+    },
+    "netbios_ssn.pcap": {
+      "windows": 12873,
+      "alarms": 1629,
+      "first_alarm_window": 11,
+      "detected": true
+    },
+    "netbios_ssn2.pcap": {
+      "windows": 12873,
+      "alarms": 1629,
+      "first_alarm_window": 11,
+      "detected": true
+    },
+    "replayAttacks.pcap": {
+      "windows": 31394,
+      "alarms": 1607,
+      "first_alarm_window": 14,
+      "detected": true
+    },
+    "ruby_drb.pcap": {
+      "windows": 12153,
+      "alarms": 1515,
+      "first_alarm_window": 11,
+      "detected": true
+    },
+    "ruby_drb2.pcap": {
+      "windows": 12153,
+      "alarms": 1515,
+      "first_alarm_window": 11,
+      "detected": true
+    },
+    "smtp.pcap": {
+      "windows": 169,
+      "alarms": 24,
+      "first_alarm_window": 6,
+      "detected": true
+    },
+    "smtp22.pcap": {
+      "windows": 169,
+      "alarms": 24,
+      "first_alarm_window": 6,
+      "detected": true
+    },
+    "tomcat.pcap": {
+      "windows": 632,
+      "alarms": 31,
+      "first_alarm_window": 11,
+      "detected": true
+    },
+    "tomcat2.pcap": {
+      "windows": 632,
+      "alarms": 31,
+      "first_alarm_window": 11,
+      "detected": true
+    },
+    "unreallrcd.pcap": {
+      "windows": 21506,
+      "alarms": 2404,
+      "first_alarm_window": 22,
+      "detected": true
+    },
+    "unreallrcd2.pcap": {
+      "windows": 21506,
+      "alarms": 2404,
+      "first_alarm_window": 22,
+      "detected": true
+    },
+    "vsftpd.pcap": {
+      "windows": 9968,
+      "alarms": 1277,
+      "first_alarm_window": 10,
+      "detected": true
+    },
+    "vsftpd2.pcap": {
+      "windows": 9968,
+      "alarms": 1277,
+      "first_alarm_window": 10,
+      "detected": true
+    },
+    "zeus.pcap": {
+      "windows": 2120,
+      "alarms": 56,
+      "first_alarm_window": 25,
+      "detected": true
+    }
+  }
+}

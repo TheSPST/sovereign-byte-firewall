@@ -1,0 +1,176 @@
+{
+  "checkpoint_path": "checkpoints/latest_patcher_ep0_gs865000_mid_epoch.pt",
+  "score_agg": "topk",
+  "topk_frac": 0.1,
+  "complexity_correction": "none",
+  "cusum": {
+    "k": 0.5,
+    "h": 718.4575570523122,
+    "mu_benign": 9.76579476586256,
+    "sigma_benign": 5.602951436568915,
+    "benign_fit_source": "calibration",
+    "fit_windows": 13614,
+    "fit_alarms": 0,
+    "fit_alarm_indices": [],
+    "target_alarms_per_10k": 0.3
+  },
+  "benign_holdout": {
+    "windows": 34043,
+    "alarms": 0,
+    "alarm_indices": [],
+    "alarms_per_10k": 0.0
+  },
+  "trace_detection_rate": 0.44,
+  "per_file": {
+    "0day.pcap": {
+      "windows": 7572,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "blackEnergy.pcap": {
+      "windows": 182,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "distcc_exec_backdoor.pcap": {
+      "windows": 19,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "distcc_exec_backdoor2.pcap": {
+      "windows": 19,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "hydra_ftp.pcap": {
+      "windows": 569,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "hydra_ftp2.pcap": {
+      "windows": 569,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "hydra_ssh.pcap": {
+      "windows": 2924,
+      "alarms": 1,
+      "first_alarm_window": 2750,
+      "detected": true
+    },
+    "hydra_ssh2.pcap": {
+      "windows": 2924,
+      "alarms": 1,
+      "first_alarm_window": 2750,
+      "detected": true
+    },
+    "java_rmi.pcap": {
+      "windows": 5689,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "java_rmi2.pcap": {
+      "windows": 5689,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "mirai.pcap": {
+      "windows": 147711,
+      "alarms": 127,
+      "first_alarm_window": 1647,
+      "detected": true
+    },
+    "netbios_ssn.pcap": {
+      "windows": 12873,
+      "alarms": 6,
+      "first_alarm_window": 2323,
+      "detected": true
+    },
+    "netbios_ssn2.pcap": {
+      "windows": 12873,
+      "alarms": 6,
+      "first_alarm_window": 2323,
+      "detected": true
+    },
+    "replayAttacks.pcap": {
+      "windows": 31394,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "ruby_drb.pcap": {
+      "windows": 12153,
+      "alarms": 5,
+      "first_alarm_window": 2323,
+      "detected": true
+    },
+    "ruby_drb2.pcap": {
+      "windows": 12153,
+      "alarms": 5,
+      "first_alarm_window": 2323,
+      "detected": true
+    },
+    "smtp.pcap": {
+      "windows": 169,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "smtp22.pcap": {
+      "windows": 169,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "tomcat.pcap": {
+      "windows": 632,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "tomcat2.pcap": {
+      "windows": 632,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    },
+    "unreallrcd.pcap": {
+      "windows": 21506,
+      "alarms": 6,
+      "first_alarm_window": 5829,
+      "detected": true
+    },
+    "unreallrcd2.pcap": {
+      "windows": 21506,
+      "alarms": 6,
+      "first_alarm_window": 5829,
+      "detected": true
+    },
+    "vsftpd.pcap": {
+      "windows": 9968,
+      "alarms": 5,
+      "first_alarm_window": 3104,
+      "detected": true
+    },
+    "vsftpd2.pcap": {
+      "windows": 9968,
+      "alarms": 5,
+      "first_alarm_window": 3104,
+      "detected": true
+    },
+    "zeus.pcap": {
+      "windows": 2120,
+      "alarms": 0,
+      "first_alarm_window": null,
+      "detected": false
+    }
+  }
+}
