@@ -203,14 +203,22 @@ def log_row(args, name, m):
 
 
 def get_hf_credentials():
-    token = os.environ.get("HF_TOKEN", "").strip()
+    # Return (token_or_None, repo_id_or_None). Never return an empty STRING for
+    # the token — passing token="" makes huggingface_hub send a broken
+    # "Bearer " header ("Illegal header value"); None lets it auto-detect the
+    # CLI-cached token instead.
+    token = os.environ.get("HF_TOKEN", "").strip() or None
     if not token:
         try:
-            from huggingface_hub import HfFolder
-            token = HfFolder.get_token() or ""
+            from huggingface_hub import get_token   # modern, finds CLI-login cache
+            token = get_token()
         except Exception:
-            pass
-    repo_id = os.environ.get("HF_REPO_ID", "").strip()
+            try:
+                from huggingface_hub import HfFolder  # legacy fallback
+                token = HfFolder.get_token()
+            except Exception:
+                token = None
+    repo_id = os.environ.get("HF_REPO_ID", "").strip() or None
     return token, repo_id
 
 
