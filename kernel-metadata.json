@@ -10,7 +10,9 @@
   "enable_tpu": false,
   "enable_internet": true,
   "keywords": [],
-  "dataset_sources": [],
+  "dataset_sources": [
+    "spsttomar/network-intrusion-pcap-archive"
+  ],
   "kernel_sources": [],
   "competition_sources": [],
   "model_sources": [],

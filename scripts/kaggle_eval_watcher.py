@@ -101,6 +101,9 @@ def evaluate(args, ckpt_path):
         "--attack_dir", args.eval_data_dir,
         "--holdout_attack_pcap", os.path.join(args.eval_data_dir, args.holdout_attack),
         "--output_dir", out_dir,
+        "--batch_size", "256",            # Vectorization throughput on CPU
+        "--num_workers", "2",             # Prefetch packets in worker threads
+        "--max_pcap_size_mb", "5.0",      # Exclude huge files (like 93MB mirai.pcap) from calibration to save CPU time
     ]
     print(f"[watcher] evaluating {name} on CPU ...", flush=True)
     r = subprocess.run(cmd, cwd=REPO_ROOT, env=env)

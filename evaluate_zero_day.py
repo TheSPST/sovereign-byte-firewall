@@ -109,6 +109,10 @@ def parse_args():
                               "TOO-predictable as well as too-surprising. Catches low-entropy "
                               "attacks (padding floods, repeated probes, C2 heartbeats) that "
                               "one-sided surprise misses by construction.")
+    parser.add_argument("--num_workers", type=int, default=0,
+                         help="Number of background workers for data loading (default: 0)")
+    parser.add_argument("--max_pcap_size_mb", type=float, default=None,
+                         help="Skip files in the calibration attack directory larger than this MB size (default: None)")
     return parser.parse_args()
 
 
@@ -164,7 +168,7 @@ def _window_complexity_bits_per_byte(rows, method):
 
 
 @torch.no_grad()
-def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="mean", topk_frac=0.1,
+def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, num_workers=0, agg="mean", topk_frac=0.1,
                complexity_correction="none"):
     """
     Returns a list of per-window "surprise" scores (bits) — negative log2
@@ -188,7 +192,7 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="m
     dataloader = get_pcap_dataloader(
         pcap_path=pcap_path,
         batch_size=batch_size,
-        num_workers=0,
+        num_workers=num_workers,
         max_sequence_length=max_sequence_length,
         # Eval must not pollute data/anomaly_labels.csv with side-channel rows,
         # and skipping the per-packet scapy parse roughly halves scoring time.
@@ -248,9 +252,18 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, agg="m
     return scores
 
 
-def discover_attack_files(attack_dir, exclude_basenames):
+def discover_attack_files(attack_dir, exclude_basenames, max_size_mb=None):
     files = sorted(glob.glob(os.path.join(attack_dir, "*.pcap")))
-    return [f for f in files if os.path.basename(f) not in exclude_basenames]
+    filtered = []
+    for f in files:
+        if os.path.basename(f) in exclude_basenames:
+            continue
+        if max_size_mb is not None:
+            size_mb = os.path.getsize(f) / (1024 * 1024)
+            if size_mb > max_size_mb:
+                continue
+        filtered.append(f)
+    return filtered
 
 
 def pick_thresholds(y_true, y_scores, target_fpr):
@@ -363,13 +376,14 @@ def main():
         os.path.basename(args.benign_holdout_pcap),
         os.path.basename(args.holdout_attack_pcap),
     }
-    attack_files = discover_attack_files(args.attack_dir, exclude)
+    attack_files = discover_attack_files(args.attack_dir, exclude, max_size_mb=args.max_pcap_size_mb)
     print(f"\nCalibration attack files ({len(attack_files)}): "
           f"{[os.path.basename(f) for f in attack_files]}")
 
     # --- Calibration set ---
     print(f"\nScoring benign calibration file: {args.benign_calibration_pcap}")
     benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
+                                num_workers=args.num_workers,
                                 agg=args.score_agg, topk_frac=args.topk_frac,
                                 complexity_correction=args.complexity_correction)
     print(f"  -> {len(benign_scores)} windows scored")
@@ -379,6 +393,7 @@ def main():
     for f in attack_files:
         print(f"Scoring attack file: {f}")
         s = score_pcap(model, f, device, args.batch_size, max_seq_len,
+                        num_workers=args.num_workers,
                         agg=args.score_agg, topk_frac=args.topk_frac,
                         complexity_correction=args.complexity_correction)
         print(f"  -> {len(s)} windows scored")
@@ -425,12 +440,14 @@ def main():
     # --- True held-out generalization check ---
     print(f"\nScoring HELD-OUT benign file (never used for calibration): {args.benign_holdout_pcap}")
     holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len,
+                                        num_workers=args.num_workers,
                                         agg=args.score_agg, topk_frac=args.topk_frac,
                                         complexity_correction=args.complexity_correction)
     print(f"  -> {len(holdout_benign_scores)} windows scored")
 
     print(f"Scoring HELD-OUT attack file (never used for calibration): {args.holdout_attack_pcap}")
     holdout_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
+                                        num_workers=args.num_workers,
                                         agg=args.score_agg, topk_frac=args.topk_frac,
                                         complexity_correction=args.complexity_correction)
     print(f"  -> {len(holdout_attack_scores)} windows scored")
