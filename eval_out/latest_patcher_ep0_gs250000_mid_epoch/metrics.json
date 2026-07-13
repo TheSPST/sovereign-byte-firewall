@@ -1,0 +1,91 @@
+{
+  "checkpoint_path": "/Users/shubhamtomar/Documents/sovereign-byte-firewall/hf_ckpt_eval/checkpoints/latest_patcher_ep0_gs250000_mid_epoch.pt",
+  "max_sequence_length": 512,
+  "score_agg": "topk",
+  "topk_frac": 0.1,
+  "complexity_correction": "none",
+  "typicality": false,
+  "typicality_mu": null,
+  "calibration": {
+    "benign_file": "scratch/archive_upload/normal.pcap",
+    "attack_files": [
+      "blackEnergy.pcap",
+      "distcc_exec_backdoor.pcap",
+      "distcc_exec_backdoor2.pcap",
+      "hydra_ftp.pcap",
+      "hydra_ftp2.pcap",
+      "hydra_ssh.pcap",
+      "hydra_ssh2.pcap",
+      "java_rmi.pcap",
+      "java_rmi2.pcap",
+      "smtp.pcap",
+      "smtp22.pcap",
+      "tomcat.pcap",
+      "tomcat2.pcap",
+      "zeus.pcap"
+    ],
+    "num_benign_windows": 13614,
+    "num_attack_windows": 22306,
+    "auc": 0.6613653019961374,
+    "youden": {
+      "threshold": 13.087355613708496,
+      "tpr": 0.4364296601811172,
+      "fpr": 0.14294109005435582
+    },
+    "target_fpr": {
+      "requested": 0.01,
+      "threshold": 14.148983001708984,
+      "tpr": 0.07993365013897606,
+      "fpr": 0.009989716468341413
+    },
+    "evt": {
+      "threshold": 14.151502549381496,
+      "tail_quantile": 0.98,
+      "t0": 13.913627014160156,
+      "gpd_shape": -0.10590790075093148,
+      "gpd_scale": 0.35463045611737487,
+      "num_tail_points": 273,
+      "target_fpr": 0.01
+    },
+    "per_file_mean_score": {
+      "benign_calibration": 9.219157231540096,
+      "blackEnergy.pcap": 13.211435354672945,
+      "distcc_exec_backdoor.pcap": 11.975367533533197,
+      "distcc_exec_backdoor2.pcap": 11.975367533533197,
+      "hydra_ftp.pcap": 11.136134407432301,
+      "hydra_ftp2.pcap": 11.136134407432301,
+      "hydra_ssh.pcap": 10.206852241993847,
+      "hydra_ssh2.pcap": 10.206852241993847,
+      "java_rmi.pcap": 13.424568443227933,
+      "java_rmi2.pcap": 13.424568443227933,
+      "smtp.pcap": 12.883818383752947,
+      "smtp22.pcap": 12.883818383752947,
+      "tomcat.pcap": 10.982931948915313,
+      "tomcat2.pcap": 10.982931948915313,
+      "zeus.pcap": 10.535508115533387
+    }
+  },
+  "holdout": {
+    "benign_file": "scratch/archive_upload/normal2.pcap",
+    "attack_file": "scratch/archive_upload/0day.pcap",
+    "num_benign_windows": 34043,
+    "num_attack_windows": 7572,
+    "results": {
+      "youden": {
+        "threshold": 13.087355613708496,
+        "holdout_benign_false_positive_rate": 0.00014687307229092618,
+        "holdout_attack_detection_rate": 0.09786053882725831
+      },
+      "target_fpr": {
+        "threshold": 14.148983001708984,
+        "holdout_benign_false_positive_rate": 5.8749228916370475e-05,
+        "holdout_attack_detection_rate": 0.05665610142630745
+      },
+      "evt": {
+        "threshold": 14.151502549381496,
+        "holdout_benign_false_positive_rate": 5.8749228916370475e-05,
+        "holdout_attack_detection_rate": 0.05665610142630745
+      }
+    }
+  }
+}
