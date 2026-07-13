@@ -112,11 +112,12 @@ def parse_args():
                         "alarms inside interval+margin count as detections, and these regions "
                         "are excluded from false-alarm counting")
     p.add_argument("--output_dir", type=str, default="results/cic_day_eval")
-    p.add_argument("--stop_after", type=str, default=None,
-                   help="Local HH:MM at which to stop streaming (fast partial run). "
-                        "e.g. '11:30' on Wednesday covers the benign lead-in + all 4 DoS "
-                        "attacks (done by 11:23) and skips the afternoon Heartbleed — "
-                        "~half the runtime. Attacks after the cutoff are marked "
+    p.add_argument("--stop_after_minutes", type=float, default=None,
+                   help="Stop streaming this many minutes of CAPTURE time after the first "
+                        "packet (timezone-independent, fast partial run). Wednesday's 4 DoS "
+                        "attacks all finish within ~2.5h of the ~09:00 capture start, so "
+                        "e.g. 210 (3.5h) covers the benign lead-in + all 4 DoS and skips the "
+                        "afternoon Heartbleed. Attacks after the cutoff are marked "
                         "'outside captured range', not counted as missed.")
     return p.parse_args()
 
@@ -219,33 +220,39 @@ def main():
     model, seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
 
     # ---- Pass over the day (single streaming pass; scores + timestamps) ----
-    # --stop_after HH:MM: stop streaming once capture time passes this local
-    # clock. Lets you evaluate just the morning DoS block (all 4 DoS attacks
-    # finish by ~11:23) in ~half the runtime, skipping the afternoon. Attacks
-    # scheduled after the cutoff are reported as 'outside captured range'.
-    stop_epoch = None            # resolved lazily once we know the first timestamp
+    # --stop_after_minutes N: stop once N minutes of CAPTURE time have elapsed
+    # since the first packet (timezone-independent). Fast partial run covering
+    # the morning DoS block; attacks after the cutoff -> 'outside captured range'.
+    def _local(ts):
+        return datetime.datetime.utcfromtimestamp(ts + args.utc_offset_hours * 3600)
+    t_start = None
+    stop_epoch = None
     scores, tss = [], []
     n = 0
     for s, t in stream_window_scores(model, device, args.pcap, seq_len,
                                      args.batch_size, args.score_agg, args.topk_frac):
-        if args.stop_after and stop_epoch is None:
-            _lt0 = datetime.datetime.utcfromtimestamp(t + args.utc_offset_hours * 3600)
-            _mid = t - (_lt0.hour * 3600 + _lt0.minute * 60 + _lt0.second)
-            _h, _m = map(int, args.stop_after.split(":"))
-            stop_epoch = _mid + _h * 3600 + _m * 60
+        if t_start is None:
+            t_start = t
+            print(f"First packet capture time: {_local(t):%Y-%m-%d %H:%M:%S} "
+                  f"(local, utc_offset={args.utc_offset_hours}h)")
+            if args.stop_after_minutes is not None:
+                stop_epoch = t_start + args.stop_after_minutes * 60
         if stop_epoch is not None and t > stop_epoch:
-            print(f"  [stop_after {args.stop_after}] reached — halting stream early.")
+            print(f"  [stop_after_minutes {args.stop_after_minutes}] reached "
+                  f"(capture time {_local(t):%H:%M}) — halting stream early.")
             break
         scores.append(s)
         tss.append(t)
         n += 1
         if n % 100000 == 0:
-            print(f"  ... {n} windows scored "
-                  f"(capture time {datetime.datetime.utcfromtimestamp(t + args.utc_offset_hours * 3600):%H:%M})")
+            print(f"  ... {n} windows scored (capture time {_local(t):%H:%M})")
     scores = np.asarray(scores)
     tss = np.asarray(tss)
+    if len(tss):
+        print(f"Captured window range: {_local(float(tss[0])):%H:%M} -> "
+              f"{_local(float(tss[-1])):%H:%M} local")
     print(f"Total: {len(scores)} windows scored"
-          + (f" (stopped at {args.stop_after} local)" if args.stop_after else " across the day"))
+          + (f" (stopped {args.stop_after_minutes} min after start)" if args.stop_after_minutes else " across the day"))
     if len(scores) < 1000:
         print("ERROR: too few windows.", file=sys.stderr)
         sys.exit(1)
