@@ -179,9 +179,19 @@ def configure_hardware_limits(args):
     cuda_available = torch.cuda.is_available()
     if not cuda_available and not args.bypass_cuda_check:
         print("ERROR: CUDA GPU is not available on this machine.", file=sys.stderr)
-        print("Please verify your Kaggle Notebook has 'GPU T4 x2' or 'GPU P100' accelerator turned on.", file=sys.stderr)
+        print("Please verify your Kaggle Notebook has the 'GPU T4 x2' accelerator turned on.", file=sys.stderr)
         raise RuntimeError("Production training requires an NVIDIA GPU with CUDA.")
         
+    if cuda_available:
+        # Check GPU compute capability to avoid CUDA error: no kernel image is available
+        major, minor = torch.cuda.get_device_capability(0)
+        if major < 7:
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"ERROR: Detected GPU '{gpu_name}' with CUDA capability {major}.{minor}.", file=sys.stderr)
+            print("The pre-installed PyTorch version on Kaggle requires CUDA capability >= 7.0 (sm_70+).", file=sys.stderr)
+            print("Tesla P100 (sm_60) is NOT compatible. Please switch your Kaggle accelerator to 'GPU T4 x2'.", file=sys.stderr)
+            raise RuntimeError("Unsupported GPU architecture (compute capability < 7.0).")
+
     # Default parameters before scaling checks
     batch_size = args.batch_size
     max_sequence_length = args.max_sequence_length

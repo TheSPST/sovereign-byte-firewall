@@ -1,0 +1,88 @@
+{
+  "window_sec": 1.0,
+  "calibration": {
+    "benign_file": "scratch/archive_upload/normal.pcap",
+    "attack_files": [
+      "blackEnergy.pcap",
+      "distcc_exec_backdoor.pcap",
+      "distcc_exec_backdoor2.pcap",
+      "hydra_ftp.pcap",
+      "hydra_ftp2.pcap",
+      "hydra_ssh.pcap",
+      "hydra_ssh2.pcap",
+      "java_rmi.pcap",
+      "java_rmi2.pcap",
+      "mirai.pcap",
+      "netbios_ssn.pcap",
+      "netbios_ssn2.pcap",
+      "replayAttacks.pcap",
+      "ruby_drb.pcap",
+      "ruby_drb2.pcap",
+      "smtp.pcap",
+      "smtp22.pcap",
+      "tomcat.pcap",
+      "tomcat2.pcap",
+      "unreallrcd.pcap",
+      "unreallrcd2.pcap",
+      "vsftpd.pcap",
+      "vsftpd2.pcap",
+      "zeus.pcap"
+    ],
+    "num_benign_windows": 74,
+    "num_attack_windows": 1206,
+    "auc": 0.9077809152436018,
+    "youden": {
+      "threshold": 34.0,
+      "tpr": 0.7064676616915423,
+      "fpr": 0.0
+    },
+    "target_fpr": {
+      "requested": 0.01,
+      "threshold": 33.0,
+      "tpr": 0.7097844112769486,
+      "fpr": 0.013513513513513514
+    },
+    "evt": null,
+    "per_file_mean_score": {
+      "benign_calibration": 6.202702702702703,
+      "distcc_exec_backdoor.pcap": 2.0,
+      "distcc_exec_backdoor2.pcap": 3.0,
+      "hydra_ftp.pcap": 11.636363636363637,
+      "hydra_ftp2.pcap": 11.636363636363637,
+      "hydra_ssh.pcap": 193.125,
+      "hydra_ssh2.pcap": 193.125,
+      "java_rmi.pcap": 398.69354838709677,
+      "java_rmi2.pcap": 398.69354838709677,
+      "netbios_ssn.pcap": 306.65,
+      "netbios_ssn2.pcap": 307.0,
+      "ruby_drb.pcap": 259.0,
+      "ruby_drb2.pcap": 259.2173913043478,
+      "smtp.pcap": 1.0,
+      "smtp22.pcap": 1.0,
+      "tomcat.pcap": 2.5555555555555554,
+      "tomcat2.pcap": 2.6666666666666665,
+      "unreallrcd.pcap": 54.61009174311926,
+      "unreallrcd2.pcap": 54.62614678899082,
+      "vsftpd.pcap": 253.1578947368421,
+      "vsftpd2.pcap": 253.47368421052633
+    }
+  },
+  "holdout": {
+    "benign_file": "scratch/archive_upload/normal2.pcap",
+    "attack_file": "scratch/archive_upload/0day.pcap",
+    "num_benign_windows": 26,
+    "num_attack_windows": 0,
+    "results": {
+      "youden": {
+        "threshold": 34.0,
+        "holdout_benign_false_positive_rate": 0.0,
+        "holdout_attack_detection_rate": null
+      },
+      "target_fpr": {
+        "threshold": 33.0,
+        "holdout_benign_false_positive_rate": 0.0,
+        "holdout_attack_detection_rate": null
+      }
+    }
+  }
+}
