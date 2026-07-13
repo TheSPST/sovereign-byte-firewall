@@ -48,7 +48,7 @@ import math
 import bisect
 import argparse
 import datetime
-
+import dpkt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -209,36 +209,38 @@ def stream_window_scores(model, device, pcap_path, seq_len, batch_size, agg, top
                 pw = torch.topk(surprise, k=k, dim=1).values.mean(dim=1)
             for s, t in zip(pw.cpu().tolist(), ts_chunk):
                 yield s, t
+    
+    try:
+        reader = dpkt.pcap.Reader(fobj)
+    except ValueError:
+        fobj.seek(0)
+        reader = dpkt.pcapng.Reader(fobj)
 
-    with RawPcapReader(fobj) as reader:
-        global_off = 0
-        for packet_data, meta in reader:
-            ts = _packet_epoch(meta)
+    global_off = 0
+    for ts, packet_data in reader:
+        masked = masker._mask_packet_addresses(packet_data, stream_tls_state=tls_state)
+        marks_off.append(global_off)
+        marks_ts.append(ts)
+        buffer.extend(masked)
+        global_off += len(masked)
 
-            masked = masker._mask_packet_addresses(packet_data, stream_tls_state=tls_state)
-            marks_off.append(global_off)
-            marks_ts.append(ts)
-            buffer.extend(masked)
-            global_off += len(masked)
-
-            while len(buffer) >= seq_len:
-                # Only score 1 of every `subsample` windows; skipped windows
-                # still advance the buffer (masking state stays sequential).
-                if win_counter % subsample == 0:
-                    w = bytes(buffer[:seq_len])
-                    i = bisect.bisect_right(marks_off, consumed) - 1
-                    pending.append((w, marks_ts[max(0, i)]))
-                win_counter += 1
-                del buffer[:seq_len]
-                consumed += seq_len
-            # prune old marks
-            if len(marks_off) > 4096:
-                cut = bisect.bisect_right(marks_off, consumed) - 1
-                if cut > 0:
-                    del marks_off[:cut]
-                    del marks_ts[:cut]
-            yield from flush()
-        yield from flush(force=True)
+        while len(buffer) >= seq_len:
+            if win_counter % subsample == 0:
+                w = bytes(buffer[:seq_len])
+                i = bisect.bisect_right(marks_off, consumed) - 1
+                pending.append((w, marks_ts[max(0, i)]))
+            win_counter += 1
+            del buffer[:seq_len]
+            consumed += seq_len
+            
+        if len(marks_off) > 4096:
+            cut = bisect.bisect_right(marks_off, consumed) - 1
+            if cut > 0:
+                del marks_off[:cut]
+                del marks_ts[:cut]
+                
+        yield from flush()
+    yield from flush(force=True)
     fobj.close()
 
 
