@@ -9,7 +9,11 @@ Detect zero-day network attacks from raw `.pcap` bytes using a causal transforme
 - Held-out benign FPR: **1.0%**
 - Held-out zero-day detection: **32.0%**
 
-This is the best confirmed operating point in the project to date.
+**Fused Same-Environment Results (Wednesday CIC-IDS2017 Day Evaluation):**
+- **gs75000:** 100% Detection (5/5 attacks). FPR/hour: byte=0.00, rate=0.89, fused=0.89. (Zero byte-level false alarms).
+- **gs865000:** 100% Detection (5/5 attacks). FPR/hour: byte=0.54, rate=0.89, fused=1.43. (Highly sensitive, caught Slowhttptest natively on byte detector).
+
+This strongly validates the OR-fusion strategy: the byte model captures payload exploits (Heartbleed) and standard floods (Hulk, GoldenEye), while the rate detector covers the blindspot of slow volumetric attacks (Slowhttptest).
 
 ## 3. What we confirmed this session
 
