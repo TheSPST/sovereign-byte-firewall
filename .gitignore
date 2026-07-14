@@ -23,3 +23,20 @@ data/
 *.zip
 logs/
 scratch/
+
+# Evaluation results and artifacts
+results/
+eval_out/
+eval_watcher_results*.csv
+hf_ckpt_eval/
+
+# Model checkpoints downloaded from HF
+ckpt_best/
+
+# Kaggle scripts and outputs
+kaggle_eval/
+*.ipynb
+
+# Local caches
+.cache/
+.pytest_cache/
