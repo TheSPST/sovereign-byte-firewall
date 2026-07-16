@@ -19,6 +19,14 @@ else
 fi
 
 echo "[*] Using Python at: $PYTHON_EXEC"
+
+# Kill any orphaned daemon from a previous session (it holds the WS port)
+if pgrep -f firewall_daemon.py > /dev/null 2>&1; then
+    echo "[*] Found a daemon from a previous session - stopping it..."
+    sudo pkill -f firewall_daemon.py
+    sleep 1
+fi
+
 # Forward all arguments (like --learning_time) directly to the python script
 sudo "$PYTHON_EXEC" firewall_daemon.py --interface en0 "$@" &
 DAEMON_PID=$!
@@ -37,7 +45,8 @@ echo "================================================="
 echo "Press Ctrl+C to stop the firewall and exit."
 
 # Trap Ctrl+C to kill the background python daemon safely
-trap "echo -e '\n[*] Shutting down Firewall...'; sudo kill $DAEMON_PID; exit 0" SIGINT
+# (pkill catches the actual python process, not just the sudo wrapper)
+trap "echo -e '\n[*] Shutting down Firewall...'; sudo pkill -f firewall_daemon.py; exit 0" SIGINT
 
 # Keep script running to maintain the trap
 wait $DAEMON_PID
