@@ -76,6 +76,8 @@ def parse_args():
     parser.add_argument("--rate_threshold", type=int, default=75, help="SYN rate threshold per 100ms window")
     parser.add_argument("--dedup_window", type=float, default=60.0,
                         help="Collapse repeated alerts of the same type within this many seconds into one incident (0 = disable)")
+    parser.add_argument("--incident_log", type=str, default=None,
+                        help="CSV file to append closed incidents to (default: incidents_<interface>.csv; 'none' to disable)")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length for byte patcher")
     parser.add_argument("--ws_port", type=int, default=8765, help="WebSocket port for dashboard")
     return parser.parse_args()
@@ -143,10 +145,14 @@ class IncidentAggregator:
     summarized when the incident goes quiet. Turns alert storms (e.g. one
     sustained flood = hundreds of raw alerts) into a handful of incidents."""
 
-    def __init__(self, window_seconds, alert_fn):
+    def __init__(self, window_seconds, alert_fn, incident_log=None):
         self.window = window_seconds
         self.alert_fn = alert_fn
         self.incidents = {}  # key -> {first_ts, last_ts, count, max_score}
+        self.incident_log = incident_log
+        if incident_log and not os.path.exists(incident_log):
+            with open(incident_log, "w") as f:
+                f.write("opened_at,closed_at,type,raw_alerts,peak_score\n")
 
     def report(self, key, message, score=None):
         """Returns True if the alert was emitted, False if suppressed."""
@@ -183,6 +189,14 @@ class IncidentAggregator:
                    f"(peak score {inc['max_score']:.2f})")
             logging.warning(f"[{key} INCIDENT] {msg}")
             self.alert_fn(key, msg, inc["max_score"])
+        if self.incident_log:
+            try:
+                with open(self.incident_log, "a") as f:
+                    f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(inc['first_ts']))},"
+                            f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(inc['last_ts']))},"
+                            f"{key},{inc['count']},{inc['max_score']:.2f}\n")
+            except OSError as e:
+                logging.warning(f"Could not write incident log: {e}")
         self.incidents.pop(key, None)
 
 def sniff_thread(args, device, model, masker):
@@ -191,7 +205,14 @@ def sniff_thread(args, device, model, masker):
     current_bucket = int(time.time() * 10)
     syn_count = 0
 
-    aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async)
+    incident_log = args.incident_log
+    if incident_log is None:
+        incident_log = f"incidents_{args.interface}.csv"
+    elif incident_log.lower() == "none":
+        incident_log = None
+    if incident_log:
+        logging.info(f"Incident log: {incident_log}")
+    aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async, incident_log=incident_log)
 
     # --- CALIBRATION MODE STATE ---
     is_learning = args.learning_time > 0
