@@ -54,44 +54,171 @@ def trigger_alert_async(alert_type, message, score=None):
         }
         asyncio.run_coroutine_threadsafe(broadcast_alert(alert_data), loop)
 
+DEFAULT_BYTE_THRESHOLD = 393.1
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Live Fused Firewall Daemon")
     parser.add_argument("--interface", type=str, default="en0", help="Network interface to sniff (e.g. en0, eth0)")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/latest_patcher_ep0_gs750000_mid_epoch.pt", help="Path to best checkpoint")
-    parser.add_argument("--byte_threshold", type=float, default=393.1, help="Byte anomaly threshold")
-    parser.add_argument("--learning_time", type=int, default=0, help="Run in Learning Mode for X seconds to calculate custom threshold (0 = Disabled)")
+    parser.add_argument("--byte_threshold", type=float, default=None,
+                        help=f"Byte anomaly threshold. If omitted, uses saved calibration for the interface, else {DEFAULT_BYTE_THRESHOLD}")
+    parser.add_argument("--learning_time", type=int, default=0,
+                        help="Calibrate on benign traffic for X seconds, save threshold, then go LIVE automatically (0 = Disabled)")
     parser.add_argument("--rate_threshold", type=int, default=75, help="SYN rate threshold per 100ms window")
+    parser.add_argument("--dedup_window", type=float, default=60.0,
+                        help="Collapse repeated alerts of the same type within this many seconds into one incident (0 = disable)")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length for byte patcher")
     parser.add_argument("--ws_port", type=int, default=8765, help="WebSocket port for dashboard")
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Per-environment threshold calibration (persisted per interface)
+# ---------------------------------------------------------------------------
+
+def calibration_path(interface):
+    return f"calibration_{interface}.json"
+
+def load_calibration(interface):
+    path = calibration_path(interface)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                calib = json.load(f)
+            if "byte_threshold" in calib:
+                return calib
+        except (json.JSONDecodeError, OSError) as e:
+            logging.warning(f"Could not read {path}: {e}")
+    return None
+
+def save_calibration(interface, scores_tensor):
+    """Derive a robust threshold from benign scores and persist it.
+
+    Uses the 99.9th percentile (robust to a few outlier windows) and keeps
+    mean+3*std as a reference. Returns the calibration dict.
+    """
+    quantile_thr = torch.quantile(scores_tensor, 0.999).item()
+    mean_val = scores_tensor.mean().item()
+    std_val = scores_tensor.std().item() if scores_tensor.numel() > 1 else 0.0
+    sigma_thr = mean_val + 3 * std_val
+    calib = {
+        "interface": interface,
+        "byte_threshold": max(quantile_thr, sigma_thr),
+        "quantile_999": quantile_thr,
+        "mean_plus_3sigma": sigma_thr,
+        "mean": mean_val,
+        "std": std_val,
+        "num_windows": int(scores_tensor.numel()),
+        "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    path = calibration_path(interface)
+    with open(path, "w") as f:
+        json.dump(calib, f, indent=2)
+    logging.info(f"Calibration saved to {path}")
+    return calib
+
+
+# ---------------------------------------------------------------------------
+# Incident aggregation (alert deduplication)
+# ---------------------------------------------------------------------------
+
+class IncidentAggregator:
+    """Collapses repeated alerts of the same type within a time window into
+    one incident: the first alert fires immediately, repeats are counted and
+    summarized when the incident goes quiet. Turns alert storms (e.g. one
+    sustained flood = hundreds of raw alerts) into a handful of incidents."""
+
+    def __init__(self, window_seconds, alert_fn):
+        self.window = window_seconds
+        self.alert_fn = alert_fn
+        self.incidents = {}  # key -> {first_ts, last_ts, count, max_score}
+
+    def report(self, key, message, score=None):
+        """Returns True if the alert was emitted, False if suppressed."""
+        if self.window <= 0:
+            self.alert_fn(key, message, score)
+            return True
+        now = time.time()
+        inc = self.incidents.get(key)
+        if inc is not None and (now - inc["last_ts"]) > self.window:
+            self._close(key, inc)
+            inc = None
+        if inc is None:
+            self.incidents[key] = {"first_ts": now, "last_ts": now, "count": 1,
+                                   "max_score": score if score is not None else 0.0}
+            self.alert_fn(key, message, score)
+            return True
+        inc["count"] += 1
+        inc["last_ts"] = now
+        if score is not None and score > inc["max_score"]:
+            inc["max_score"] = score
+        return False
+
+    def flush(self):
+        """Close and summarize incidents whose window has expired. Call periodically."""
+        now = time.time()
+        for key, inc in list(self.incidents.items()):
+            if (now - inc["last_ts"]) > self.window:
+                self._close(key, inc)
+
+    def _close(self, key, inc):
+        if inc["count"] > 1:
+            duration = max(1.0, inc["last_ts"] - inc["first_ts"])
+            msg = (f"Incident closed: {inc['count']} {key} alerts over {duration:.0f}s "
+                   f"(peak score {inc['max_score']:.2f})")
+            logging.warning(f"[{key} INCIDENT] {msg}")
+            self.alert_fn(key, msg, inc["max_score"])
+        self.incidents.pop(key, None)
 
 def sniff_thread(args, device, model, masker):
     tls_state = {}
     byte_buffer = bytearray()
     current_bucket = int(time.time() * 10)
     syn_count = 0
-    
-    # --- LEARNING MODE STATE ---
+
+    aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async)
+
+    # --- CALIBRATION MODE STATE ---
     is_learning = args.learning_time > 0
     learning_start = time.time()
     learning_scores = []
-    
+
     if is_learning:
-        logging.info(f"Firewall is in LEARNING MODE on '{args.interface}' for {args.learning_time} seconds...")
-        logging.info(f"Please use your browser normally so the AI can learn your traffic baseline.")
+        logging.info(f"CALIBRATING on '{args.interface}' for {args.learning_time} seconds...")
+        logging.info("Use the network normally (benign traffic only) so the AI can learn this environment's baseline.")
+        trigger_alert_async("INFO", f"Calibrating baseline for {args.learning_time}s...")
     else:
-        logging.info(f"Firewall is LIVE. Monitoring traffic on '{args.interface}'...")
-    
+        logging.info(f"Firewall is LIVE. Monitoring traffic on '{args.interface}' "
+                     f"(byte_threshold={args.byte_threshold:.2f}, dedup_window={args.dedup_window:.0f}s)...")
+
+    def finish_calibration():
+        nonlocal is_learning
+        if len(learning_scores) < 10:
+            logging.error(f"Only {len(learning_scores)} windows seen during calibration - not enough. "
+                          "Staying in calibration mode; generate more traffic.")
+            return
+        calib = save_calibration(args.interface, torch.tensor(learning_scores))
+        args.byte_threshold = calib["byte_threshold"]
+        is_learning = False
+        logging.info("=================================================")
+        logging.info(f" CALIBRATION COMPLETE for '{args.interface}'")
+        logging.info(f" Windows: {calib['num_windows']} | Mean: {calib['mean']:.2f} | Std: {calib['std']:.2f}")
+        logging.info(f" q99.9: {calib['quantile_999']:.2f} | mean+3s: {calib['mean_plus_3sigma']:.2f}")
+        logging.info(f" -> LIVE with byte_threshold = {args.byte_threshold:.2f} <-")
+        logging.info("=================================================")
+        trigger_alert_async("INFO", f"Calibration complete. LIVE with threshold {args.byte_threshold:.2f}")
+
     def packet_callback(packet):
-        nonlocal byte_buffer, current_bucket, syn_count, tls_state, is_learning, learning_scores
-        
+        nonlocal byte_buffer, current_bucket, syn_count, tls_state
+
         # 1. Rate Detector (SYN Flood Check)
         t_bucket = int(time.time() * 10)
         if t_bucket > current_bucket:
             if not is_learning and syn_count > args.rate_threshold:
                 msg = f"Volumetric anomaly detected! {syn_count} SYNs in 100ms window."
-                logging.warning(f"[RATE ALARM] {msg}")
-                trigger_alert_async("RATE", msg, score=syn_count)
+                if aggregator.report("RATE", msg, score=syn_count):
+                    logging.warning(f"[RATE ALARM] {msg}")
+            aggregator.flush()
             syn_count = 0
             current_bucket = t_bucket
             
@@ -126,29 +253,13 @@ def sniff_thread(args, device, model, masker):
                 
                 if is_learning:
                     learning_scores.append(total_entropy)
-                    elapsed = time.time() - learning_start
-                    if elapsed > args.learning_time:
-                        if len(learning_scores) == 0:
-                            logging.error("No packets processed during learning mode. Try again.")
-                        else:
-                            scores_tensor = torch.tensor(learning_scores)
-                            mean_val = scores_tensor.mean().item()
-                            std_val = scores_tensor.std().item() if len(learning_scores) > 1 else 0.0
-                            calc_threshold = mean_val + (3 * std_val)
-                            logging.info(f"=================================================")
-                            logging.info(f" CALIBRATION COMPLETE for '{args.interface}' ")
-                            logging.info(f" Processed Windows: {len(learning_scores)}")
-                            logging.info(f" Mean Entropy:      {mean_val:.2f}")
-                            logging.info(f" Std Deviation:     {std_val:.2f}")
-                            logging.info(f" -> YOUR MACBOOK THRESHOLD: {calc_threshold:.2f} <- ")
-                            logging.info(f" Run again with: --byte_threshold {calc_threshold:.2f}")
-                            logging.info(f"=================================================")
-                        os._exit(0)  # Kill the daemon cleanly
+                    if (time.time() - learning_start) > args.learning_time:
+                        finish_calibration()  # transitions to LIVE in-place, no restart needed
                 else:
                     if total_entropy > args.byte_threshold:
-                        msg = f"Payload exploit detected! Entropy score: {total_entropy:.2f} > {args.byte_threshold}"
-                        logging.critical(f"[BYTE ALARM] {msg}")
-                        trigger_alert_async("BYTE", msg, score=total_entropy)
+                        msg = f"Payload exploit detected! Entropy score: {total_entropy:.2f} > {args.byte_threshold:.2f}"
+                        if aggregator.report("BYTE", msg, score=total_entropy):
+                            logging.critical(f"[BYTE ALARM] {msg}")
 
     try:
         sniff(iface=args.interface, prn=packet_callback, store=False)
@@ -164,6 +275,20 @@ async def main_async():
     
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     logging.info(f"Hardware Acceleration: {device}")
+
+    # Threshold resolution: explicit CLI flag > saved per-interface calibration > built-in default
+    if args.byte_threshold is None:
+        calib = load_calibration(args.interface)
+        if calib is not None:
+            args.byte_threshold = calib["byte_threshold"]
+            logging.info(f"Loaded saved calibration for '{args.interface}' "
+                         f"(threshold={args.byte_threshold:.2f}, calibrated {calib.get('calibrated_at', '?')}, "
+                         f"{calib.get('num_windows', '?')} windows)")
+        else:
+            args.byte_threshold = DEFAULT_BYTE_THRESHOLD
+            if args.learning_time == 0:
+                logging.warning(f"No calibration found for '{args.interface}'. Using default threshold "
+                                f"{DEFAULT_BYTE_THRESHOLD} - consider running with --learning_time 300 first.")
     
     if not os.path.exists(args.checkpoint):
         logging.error(f"Checkpoint not found at {args.checkpoint}. Exiting.")

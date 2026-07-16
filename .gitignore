@@ -40,3 +40,6 @@ kaggle_eval/
 # Local caches
 .cache/
 .pytest_cache/
+
+# Per-environment daemon calibration
+calibration_*.json
