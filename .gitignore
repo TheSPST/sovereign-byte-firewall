@@ -43,3 +43,4 @@ kaggle_eval/
 
 # Per-environment daemon calibration
 calibration_*.json
+incidents_*.csv
