@@ -10,6 +10,7 @@ Now with real-time WebSocket broadcasting for the Web Dashboard!
 
 import os
 import sys
+import math
 import time
 import argparse
 import logging
@@ -54,14 +55,22 @@ def trigger_alert_async(alert_type, message, score=None):
         }
         asyncio.run_coroutine_threadsafe(broadcast_alert(alert_data), loop)
 
-DEFAULT_BYTE_THRESHOLD = 393.1
+# Scoring is aligned with evaluate_zero_day.py --score_agg topk --topk_frac 0.1
+# (the validated recipe). Score = mean of the top 10% per-byte surprise
+# (-log2 P(actual next byte)), in bits. 12.0 ~= the Youden threshold found on
+# the CIC eval (12.025 bits); per-environment calibration should replace it.
+SCORE_METRIC = "surprise_topk"
+DEFAULT_BYTE_THRESHOLD = 12.0
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Live Fused Firewall Daemon")
     parser.add_argument("--interface", type=str, default="en0", help="Network interface to sniff (e.g. en0, eth0)")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/latest_patcher_ep0_gs750000_mid_epoch.pt", help="Path to best checkpoint")
+    parser.add_argument("--checkpoint", type=str, default="ckpt_best/checkpoints/latest_patcher_ep0_gs75000_mid_epoch.pt",
+                        help="Path to best checkpoint (default: v2-masking gs75000 - the validated peak)")
     parser.add_argument("--byte_threshold", type=float, default=None,
-                        help=f"Byte anomaly threshold. If omitted, uses saved calibration for the interface, else {DEFAULT_BYTE_THRESHOLD}")
+                        help=f"Byte anomaly threshold in surprise bits. If omitted, uses saved calibration for the interface, else {DEFAULT_BYTE_THRESHOLD}")
+    parser.add_argument("--topk_frac", type=float, default=0.1,
+                        help="Fraction of bytes (by surprise, highest first) averaged into the window score (default 0.1, matching the validated eval recipe)")
     parser.add_argument("--learning_time", type=int, default=0,
                         help="Calibrate on benign traffic for X seconds, save threshold, then go LIVE automatically (0 = Disabled)")
     parser.add_argument("--rate_threshold", type=int, default=75, help="SYN rate threshold per 100ms window")
@@ -85,6 +94,11 @@ def load_calibration(interface):
         try:
             with open(path) as f:
                 calib = json.load(f)
+            if calib.get("score_metric") != SCORE_METRIC:
+                logging.warning(f"Ignoring {path}: calibrated with metric "
+                                f"'{calib.get('score_metric', 'entropy_sum (legacy)')}', current metric is "
+                                f"'{SCORE_METRIC}'. Re-run with --learning_time to recalibrate.")
+                return None
             if "byte_threshold" in calib:
                 return calib
         except (json.JSONDecodeError, OSError) as e:
@@ -103,6 +117,7 @@ def save_calibration(interface, scores_tensor):
     sigma_thr = mean_val + 3 * std_val
     calib = {
         "interface": interface,
+        "score_metric": SCORE_METRIC,
         "byte_threshold": max(quantile_thr, sigma_thr),
         "quantile_999": quantile_thr,
         "mean_plus_3sigma": sigma_thr,
@@ -240,25 +255,32 @@ def sniff_thread(args, device, model, masker):
             
             with torch.no_grad():
                 batch = torch.tensor([window], dtype=torch.long, device=device)
-                
+
                 # Protect against OOB indexing
                 x_in = torch.clamp(batch[:, :-1], min=0)
-                
+                targets = batch[:, 1:]
+
+                # Surprise scoring - mirrors evaluate_zero_day.py
+                # (--score_agg topk --topk_frac 0.1), the recipe validated on
+                # CIC: surprise_t = -log2 P(byte_t+1 | byte_<=t), window score
+                # = mean of the top 10% most surprising bytes.
                 logits = model(x_in)
-                probs = F.softmax(logits, dim=-1)
-                entropy_vals = -torch.sum(probs * torch.log2(probs + 1e-9), dim=-1)
-                
-                # Check for extreme "surprise" threshold
-                total_entropy = entropy_vals.sum().item()
-                
+                log_probs = F.log_softmax(logits, dim=-1)
+                gather_idx = torch.clamp(targets, min=0).unsqueeze(-1)
+                token_logprob = log_probs.gather(-1, gather_idx).squeeze(-1)
+                surprise_bits = -token_logprob / math.log(2)
+                k = max(1, min(surprise_bits.shape[1], int(round(args.topk_frac * surprise_bits.shape[1]))))
+                topk_vals, _ = torch.topk(surprise_bits, k=k, dim=1)
+                window_score = topk_vals.mean().item()
+
                 if is_learning:
-                    learning_scores.append(total_entropy)
+                    learning_scores.append(window_score)
                     if (time.time() - learning_start) > args.learning_time:
                         finish_calibration()  # transitions to LIVE in-place, no restart needed
                 else:
-                    if total_entropy > args.byte_threshold:
-                        msg = f"Payload exploit detected! Entropy score: {total_entropy:.2f} > {args.byte_threshold:.2f}"
-                        if aggregator.report("BYTE", msg, score=total_entropy):
+                    if window_score > args.byte_threshold:
+                        msg = f"Payload anomaly detected! Surprise: {window_score:.2f} bits > {args.byte_threshold:.2f}"
+                        if aggregator.report("BYTE", msg, score=window_score):
                             logging.critical(f"[BYTE ALARM] {msg}")
 
     try:
