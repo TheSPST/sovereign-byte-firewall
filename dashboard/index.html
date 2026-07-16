@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sovereign Firewall Dashboard</title>
+    <!-- Modern Typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="index.css">
+</head>
+<body>
+    <div class="background-animation"></div>
+    
+    <div class="container">
+        <!-- Header -->
+        <header class="glass-panel header">
+            <div class="logo">
+                <div class="status-orb" id="status-orb"></div>
+                <h1>SOVEREIGN <span class="highlight">BYTE</span></h1>
+            </div>
+            <div class="connection-status" id="connection-status">Connecting to Engine...</div>
+        </header>
+
+        <!-- Stats Grid -->
+        <div class="stats-grid">
+            <div class="glass-panel stat-card">
+                <h3>Byte Anomalies (Zero-Day)</h3>
+                <div class="stat-value" id="stat-byte">0</div>
+            </div>
+            <div class="glass-panel stat-card">
+                <h3>Rate Anomalies (DDoS)</h3>
+                <div class="stat-value" id="stat-rate">0</div>
+            </div>
+            <div class="glass-panel stat-card">
+                <h3>Highest Entropy</h3>
+                <div class="stat-value" id="stat-max-entropy">0.00</div>
+            </div>
+        </div>
+
+        <!-- Main Dashboard -->
+        <div class="main-dashboard">
+            <div class="glass-panel live-log-container">
+                <div class="panel-header">
+                    <h2>Live Threat Stream</h2>
+                    <button id="clear-logs" class="btn-clear">Clear</button>
+                </div>
+                <div class="log-headers">
+                    <span>TIMESTAMP</span>
+                    <span>TYPE</span>
+                    <span>SEVERITY / SCORE</span>
+                    <span>MESSAGE</span>
+                </div>
+                <div id="live-logs" class="logs">
+                    <div class="log-entry system-msg">
+                        <span class="time">-</span>
+                        <span class="type">SYSTEM</span>
+                        <span class="score">-</span>
+                        <span class="msg">Awaiting WebSocket Connection...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
