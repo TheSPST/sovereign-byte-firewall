@@ -282,8 +282,10 @@ class IncidentAggregator:
             self.alert_fn(key, msg, inc["max_score"], inc.get("enrichment"))
         if self.incident_log:
             try:
-                # context = compact JSON of the opening enrichment (CSV-safe: quoted)
-                ctx = json.dumps(inc.get("enrichment") or {}, separators=(",", ":")).replace('"', "'")
+                # context = compact JSON of the opening enrichment (CSV-safe: quoted).
+                # Drop the heatmap array — it's for the live dashboard, not the CSV.
+                ctx_data = {k: v for k, v in (inc.get("enrichment") or {}).items() if k != "heatmap"}
+                ctx = json.dumps(ctx_data, separators=(",", ":")).replace('"', "'")
                 with open(self.incident_log, "a") as f:
                     f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(inc['first_ts']))},"
                             f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(inc['last_ts']))},"
@@ -432,6 +434,14 @@ def sniff_thread(args, device, model, masker, calib=None):
                         enrich = compute_enrichment(pkt_meta)
                         if pct is not None:
                             enrich["score_percentile"] = pct
+                        # Per-byte surprise for the flagged window -> dashboard
+                        # heatmap ("what the model saw"). surprise_bits[i] scores
+                        # the prediction of window[i+1], so pair them 1:1.
+                        sb = surprise_bits[0].tolist()
+                        enrich["heatmap"] = {
+                            "bytes": [int(b) for b in window[1:]],
+                            "surprise": [round(float(x), 2) for x in sb],
+                        }
                         if aggregator.report("BYTE", msg, score=window_score, enrichment=enrich):
                             logging.critical(f"[BYTE ALARM] {msg}")
 

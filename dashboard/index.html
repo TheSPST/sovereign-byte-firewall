@@ -39,6 +39,16 @@
             </div>
         </div>
 
+        <!-- Byte Surprise Heatmap -->
+        <div class="glass-panel heatmap-panel" id="heatmap-panel" style="margin-bottom:24px;">
+            <div class="panel-header">
+                <h2>Byte Surprise Heatmap — what the model saw</h2>
+                <span id="heatmap-caption" style="color:var(--text-secondary);font-family:var(--font-mono);font-size:0.85em;">no flagged window yet</span>
+            </div>
+            <canvas id="heatmap-canvas" width="768" height="384" style="width:100%;height:auto;display:block;border-radius:8px;background:#0a0a12;"></canvas>
+            <div id="heatmap-tooltip" style="position:fixed;pointer-events:none;display:none;background:rgba(10,10,18,0.95);border:1px solid var(--glass-border);color:var(--text-primary);font-family:var(--font-mono);font-size:0.8em;padding:6px 8px;border-radius:6px;z-index:50;"></div>
+        </div>
+
         <!-- Main Dashboard -->
         <div class="main-dashboard">
             <div class="glass-panel live-log-container">
