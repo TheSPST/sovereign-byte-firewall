@@ -223,6 +223,35 @@ Sweep `--order 2,3,4,5`. **Decision rule:**
 **Why it matters:** this is the sharpest "why not something simpler?" question,
 and right now we can't answer it. The experiment settles it cheaply.
 
+**VERDICT (run 2026-07-17, CIC split, transformer JUSTIFIED):** the n-gram
+*loses decisively — via generalization, not detection.*
+
+| model (same CIC split) | held-out benign FPR | held-out 0day detection |
+|---|---|---|
+| n-gram order 2 | 98.3% | ~100% (meaningless) |
+| n-gram order 3 | 98.5% | 100% |
+| n-gram order 4 | 98.7% | 100% |
+| n-gram order 5 | 98.7% | 100% |
+| **transformer gs75000** | **0.23%** | **32.6%** |
+
+The n-gram's calibration AUC looks perfect (~0.999) but that's a memorization
+artifact: it flags **98%+ of *held-out benign* traffic** (`normal2.pcap`),
+making it unusable. It memorizes exact byte contexts; any context it hasn't seen
+verbatim — including ordinary benign traffic — backs off to ~8 bits and trips.
+The transformer assigns *low* surprise to unseen benign because it learned
+general protocol structure. ~400× gap on the metric that decides deployability.
+
+**Caveat (honest):** the n-gram trained on only the calibration pcap (~13.6k
+windows) vs the transformer's full Monday corpus. But the failure is
+*structural*, not data-starvation: n-grams have no notion of context similarity —
+every unseen context is equally surprising (uniform backoff), whereas the
+transformer's embeddings interpolate across similar contexts. On diverse /
+encrypted traffic the byte-context space is effectively unbounded, so no finite
+training set closes the gap. Airtight version: `--train_pcap Monday.pcap`
+(expected to improve the n-gram but not to transformer-grade FPR). **This
+ablation is the answer to "why not something simpler?" — cite it in due
+diligence.**
+
 ---
 
 ## Sequencing vs. GTM (July–August 2026)
