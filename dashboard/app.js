@@ -37,15 +37,15 @@ function renderHeatmap(hm) {
     const cw = heatmapCanvas.width / HM_COLS;
     const ch = heatmapCanvas.height / rows;
     // Fixed scale: per-byte surprise ~0..8 bits; >=8 is fully "hot".
+    // Traffic-light ramp: green (expected) -> amber (mid) -> red (surprising).
     const HOT = 8.0;
     ctx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
     for (let i = 0; i < n; i++) {
         const r = Math.floor(i / HM_COLS), c = i % HM_COLS;
         const t = Math.max(0, Math.min(1, hm.surprise[i] / HOT));
-        // cool dark base, red glow rising with surprise
-        const red = Math.round(255 * t);
-        const grn = Math.round(40 + 40 * (1 - t));
-        const blu = Math.round(70 * (1 - t) + 30 * t);
+        const red = Math.round(255 * Math.min(1, t * 2));        // ramps in on the low half
+        const grn = Math.round(210 * Math.min(1, (1 - t) * 2));  // fades out on the high half
+        const blu = 45;                                          // constant -> keeps low end readable
         ctx.fillStyle = `rgb(${red},${grn},${blu})`;
         ctx.fillRect(c * cw + 0.5, r * ch + 0.5, cw - 1, ch - 1);
     }
