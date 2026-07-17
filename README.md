@@ -24,7 +24,8 @@ connection-rate detector.
 | False alarms that day | **0.9–1.4/hour** (byte detector alone: 0–0.5/hour) |
 | Held-out zero-day window detection (byte model, strictest metric) | 32.6% @ **0.23% FPR** |
 | Live deployment (real traffic, MacBook, 1h self-calibration) | measurement in progress |
-| Second dataset (UNSW-NB15) | in progress |
+| **Cross-dataset transfer to UNSW-NB15** (trained on CIC benign only) | **calibration AUC 0.752** vs 0.726 on CIC — near-identical |
+| Held-out Shellcode on UNSW (byte-only, hardest single-class) | 8.5% @ 1.4% FPR |
 
 Window-level detection and campaign-level detection differ because an attack
 campaign generates thousands of windows — flagging a fraction catches the
