@@ -105,6 +105,62 @@ premature before one is signed.
 
 ---
 
+## Phase H — Hardening & robustness (from LIMITATIONS.md / MITIGATION_PLAN.md)
+
+Priority-ordered (cheapest-strongest first). These answer the five standing
+limitations; each is scoped to a self-contained work session with a rough
+effort estimate. None block first-customer outreach — they're what turn the
+honest limitations into "managed, here's how."
+
+### H.1 Cross-session CUSUM accumulator — *~3–4 days* — answers the APT / slow-low critique
+Per-(src↔dst) bounded-memory accumulator that sums small per-window surprises
+over a long horizon (24–48h) via CUSUM/EWMA, firing when cumulative deviation
+crosses a bound even though no single window tripped. Add beaconing / rare-
+destination detection (regular inter-arrival to unusual endpoints). Third input
+to the OR-fusion, keyed by host-pair, evicted by LRU + time.
+**Acceptance:** a synthetic "one improbable packet every 6h, each sub-threshold"
+sequence is caught by the accumulator while the per-window scorer stays silent.
+**Note:** also validate the plain-surprise CUSUM variant on the held-out eval
+(the one untested scoring idea from memory).
+
+### H.2 Drift monitoring + poisoning-safe baseline update — *~3 days* — answers concept drift
+Builds on the shipped alert-budget calibration. (a) Track live score distribution
+vs. the calibration baseline (PSI/KL); auto-flag when the baseline is stale.
+(b) "Mark false positive" on the dashboard → fold confirmed-benign windows into
+a baseline buffer and *re-derive the threshold* (never a full weight retrain).
+(c) Keep a **frozen reference model** + bound the update rate so a slow-poisoning
+attacker can't shift "normal" to accept malice.
+**Acceptance:** a simulated environment change (score mean shifts +2 bits) raises
+a "baseline stale" flag rather than a false-alarm storm; a slow-poison sequence
+is rejected by the frozen-reference divergence check.
+
+### H.3 Envelope/metadata upweighting — *~2 days* — sharpens the one signal we keep inside encryption
+Explicitly weight packet timing intervals, sizes, and connection-sequence
+features alongside the byte score for flows whose payload is masked (TLS/QUIC/
+SSH). JA3/JA4-style handshake fingerprint + cert/SNI anomaly as cheap adds.
+**Acceptance:** an in-tunnel exfil burst with abnormal size/timing is flagged by
+the envelope signal even though its payload bytes are masked.
+
+### H.4 Invariant checkers + private-weights policy — *~1 day code + policy* — defense-in-depth
+Rule-based hard limits that alert regardless of ML score (e.g. connection to
+known-bad ASN, impossible protocol state, egress to non-allowlisted port on a
+locked-down segment). Plus formalize the open-core boundary: **customer-tuned
+weights + calibration thresholds are private** (denies the white-box attacker
+the model — the cheapest strong adversarial defense).
+**Acceptance:** an invariant fires on a crafted low-surprise payload that the
+byte model rates benign.
+
+### H.5 XDP throughput benchmark → then Mamba backbone — *~2 days bench, Mamba ~1–2 wks* — answers line-rate
+Before any line-rate claim, measure the **steer-down ratio** and sustained
+windows/sec + Mbps on real traffic (M2 Pro CPU/MPS and one A100). Prototype the
+XDP allowlist-pass / steer-unknown front-end; the byte-model stays the userspace
+second stage. Then evaluate a NetMamba-style backbone (arXiv:2405.11449 /
+MambaNetBurst 2605.11034) for the 1–60× inference speedup.
+**Acceptance:** published throughput number + measured steered fraction; only
+then does the brief mention line-rate scale.
+
+---
+
 ## Sequencing vs. GTM (July–August 2026)
 
 | When | GTM track (critical path) | Product track (this doc) |
