@@ -68,13 +68,13 @@ def learn_check(model, device, seq_len, steps, lr=1e-3):
     return first, last
 
 
-def build(name, d_model, layers, seq_len):
+def build(name, d_model, layers, seq_len, d_state=None):
     if name == "transformer":
         return NetworkBytePatcher(d_model=d_model, nhead=4, num_layers=layers,
                                   max_sequence_length=seq_len)
     variant = "mamba2" if name == "mamba2" else "mamba1"
     return MambaBytePatcher(d_model=d_model, num_layers=layers,
-                            max_sequence_length=seq_len, variant=variant)
+                            max_sequence_length=seq_len, variant=variant, d_state=d_state)
 
 
 def main():
@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--seq_lens", type=int, nargs="+", default=[512, 2048])
     ap.add_argument("--learn_steps", type=int, default=150)
+    ap.add_argument("--d_state", type=int, default=None,
+                    help="SSM state dim (Mamba). Larger favors Mamba-2's SSD matmul path — "
+                         "raise it (e.g. 128/256) to test where Mamba-2 pulls ahead.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else
@@ -103,7 +106,7 @@ def main():
         names.append("mamba1")  # torch_scan fallback, so at least one Mamba shows
 
     max_seq = max(args.seq_lens)
-    models = {n: build(n, args.d_model, args.layers, max_seq) for n in names}
+    models = {n: build(n, args.d_model, args.layers, max_seq, d_state=args.d_state) for n in names}
     pstr = " | ".join(f"{n} {params(m):,} ({params(m)/params(models['transformer']):.2f}x)"
                       for n, m in models.items())
     print(f"Params: {pstr}\n")
@@ -123,7 +126,8 @@ def main():
 
     print("Learning sanity check (periodic pattern, loss should drop):")
     for n in names:
-        f_, l_ = learn_check(build(n, args.d_model, args.layers, max_seq), device, 256, args.learn_steps)
+        f_, l_ = learn_check(build(n, args.d_model, args.layers, max_seq, d_state=args.d_state),
+                             device, 256, args.learn_steps)
         ok = "OK" if l_ < f_ * 0.5 else "?? (loss did not halve)"
         print(f"  {n:>11}: loss {f_:.3f} -> {l_:.3f}   {ok}")
 

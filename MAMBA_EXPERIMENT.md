@@ -62,6 +62,22 @@ variant="mamba2")` (default), `build_backbone("mamba2"|"mamba1")`, `train_ab.py
 now benchmarks transformer vs mamba1 vs mamba2 side by side (whichever kernels are
 installed). Re-run the benchmark to get the Mamba-2 speedup vs the 1.85x below.
 
+## Mamba-2 result (2026-07-18, Kaggle GPU, both kernels present) — did NOT beat Mamba-1 at our scale
+| seq_len | transformer | mamba1 | mamba2 |
+|---|---|---|---|
+| 512  | 1.00x | **1.40x** | 1.14x |
+| 2048 | 1.00x | 1.84x | **1.85x** |
+
+Params ~equal (mamba1 299,520 / mamba2 301,336, both ~0.41x transformer). All
+three train (loss ->~0.008). **Finding: at our tiny scale (d_model 128, d_state
+64, ~300k params) Mamba-2's SSD/matmul advantage does not materialize** — kernel
+overhead dominates, and Mamba-1's simpler scan is competitive/faster at 512. The
+30-60% Mamba-2 gain is a large-`d_state`/large-model effect. To test where it
+pulls ahead, scale up: `python bench_backbones.py --d_model 256 --d_state 128
+--seq_lens 512 2048 4096` (bench now exposes `--d_state`). Decision so far: at the
+current lightweight config **Mamba-1 is the pick** (marginally faster, simpler);
+re-evaluate Mamba-2 only at the iso-capacity/large config used for the accuracy A/B.
+
 ## Throughput A/B result (2026-07-18, Kaggle GPU, torch 2.10+cu128, fused mamba_ssm — Mamba-1)
 Forward-pass throughput, d_model=128 / 2 layers / batch 64:
 
