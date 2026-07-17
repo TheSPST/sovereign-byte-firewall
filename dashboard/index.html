@@ -46,6 +46,11 @@
                 <span id="heatmap-caption" style="color:var(--text-secondary);font-family:var(--font-mono);font-size:0.85em;">no flagged window yet</span>
             </div>
             <canvas id="heatmap-canvas" width="768" height="384" style="width:100%;height:auto;display:block;border-radius:8px;background:#0a0a12;"></canvas>
+            <div style="display:flex;gap:18px;margin-top:10px;font-family:var(--font-mono);font-size:0.8em;color:var(--text-secondary);">
+                <span><span style="display:inline-block;width:11px;height:11px;border-radius:2px;background:rgb(0,210,45);vertical-align:-1px;"></span> expected (low surprise)</span>
+                <span><span style="display:inline-block;width:11px;height:11px;border-radius:2px;background:rgb(230,180,45);vertical-align:-1px;"></span> unusual</span>
+                <span><span style="display:inline-block;width:11px;height:11px;border-radius:2px;background:rgb(255,45,45);vertical-align:-1px;"></span> anomalous (high surprise)</span>
+            </div>
             <div id="heatmap-tooltip" style="position:fixed;pointer-events:none;display:none;background:rgba(10,10,18,0.95);border:1px solid var(--glass-border);color:var(--text-primary);font-family:var(--font-mono);font-size:0.8em;padding:6px 8px;border-radius:6px;z-index:50;"></div>
         </div>
 
