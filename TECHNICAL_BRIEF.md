@@ -46,6 +46,7 @@ This is an anomaly detector, not a full IDS replacement — an *additional layer
 - It flags *structural anomalies*, not named threats. Triage still belongs to your analysts (alerts carry score, time, and traffic context).
 - Slow, low-rate brute-force (e.g. patient FTP password guessing) evades both detectors today; that class is already well covered by fail2ban-style tooling and auth logs. Session-level features to close this gap are on the roadmap.
 - Encrypted payload *contents* are invisible to everyone, including us. We detect anomalies in protocol structure, timing envelope, and unencrypted regions.
+- A patient sub-threshold adversary, concept drift after major environment changes, and white-box adversarial evasion are real limits, and core-router line rate requires an XDP pre-filter front-end. We document all of this openly in `LIMITATIONS.md` — an anomaly detector that claims no blind spots is lying, and honest scope is why our numbers can be trusted.
 
 ## Pilot proposal
 
