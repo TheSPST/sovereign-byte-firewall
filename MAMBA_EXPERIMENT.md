@@ -51,7 +51,18 @@ Mbps on one A100 (and M2 Pro MPS if relevant) for both backbones at seq_len 512,
 batch 512. This is the "cost at the edge" number the pre-filter positioning
 depends on.
 
-## Throughput A/B result (2026-07-18, Kaggle GPU, torch 2.10+cu128, fused mamba_ssm)
+## Mamba-1 vs Mamba-2 (SSD)
+The first throughput run used **Mamba-1** (`mamba_ssm.Mamba`). **Mamba-2**
+(`mamba_ssm.Mamba2`, Structured State Space Duality) recasts the scan as
+tensor-core matmuls — typically 30–60% faster forward/backward and runs a larger
+`d_state` well; its scalar-`A` structure *may* also regularize (a hypothesis for
+the accuracy A/B, not a given). The code now supports both: `MambaBytePatcher(...,
+variant="mamba2")` (default), `build_backbone("mamba2"|"mamba1")`, `train_ab.py
+--backbone mamba2`, `evaluate_zero_day.py --backbone mamba2`. `bench_backbones.py`
+now benchmarks transformer vs mamba1 vs mamba2 side by side (whichever kernels are
+installed). Re-run the benchmark to get the Mamba-2 speedup vs the 1.85x below.
+
+## Throughput A/B result (2026-07-18, Kaggle GPU, torch 2.10+cu128, fused mamba_ssm — Mamba-1)
 Forward-pass throughput, d_model=128 / 2 layers / batch 64:
 
 | seq_len | transformer | mamba | speedup |

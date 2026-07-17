@@ -31,11 +31,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Mamba-1 (classic selective scan) and Mamba-2 (SSD / matmul-optimized) both ship
+# in mamba_ssm. Mamba-2 is faster on GPU (tensor-core matmuls, larger d_state) and
+# its scalar-A structure may regularize — tested in the accuracy A/B, not assumed.
 try:
-    from mamba_ssm import Mamba as _FastMamba
-    _HAS_MAMBA_SSM = True
+    from mamba_ssm import Mamba as _Mamba1
+    _HAS_MAMBA1 = True
 except Exception:
-    _HAS_MAMBA_SSM = False
+    _HAS_MAMBA1 = False
+try:
+    from mamba_ssm import Mamba2 as _Mamba2
+    _HAS_MAMBA2 = True
+except Exception:
+    _HAS_MAMBA2 = False
+
+_HAS_MAMBA_SSM = _HAS_MAMBA1 or _HAS_MAMBA2  # any fused kernel available
 
 
 class MambaBlockTorch(nn.Module):
@@ -88,23 +98,45 @@ class MambaBytePatcher(nn.Module):
     NetworkBytePatcher (same forward contract), no positional embedding."""
 
     def __init__(self, d_model=128, num_layers=2, max_sequence_length=512,
-                 d_state=16, d_conv=4, expand=2, force_torch_scan=False):
+                 d_state=None, d_conv=4, expand=2, variant="mamba2",
+                 headdim=64, force_torch_scan=False):
         super().__init__()
         self.vocab_size = 256
         self.max_sequence_length = max_sequence_length
         self.byte_embedding = nn.Embedding(self.vocab_size, d_model)
-        use_fast = _HAS_MAMBA_SSM and not force_torch_scan
+
+        # Resolve backend: requested variant if its kernel is present, else the
+        # other Mamba kernel, else the pure-torch scan (Mamba-1 style).
+        want2 = (variant == "mamba2")
+        if force_torch_scan:
+            backend = "torch_scan"
+        elif want2 and _HAS_MAMBA2:
+            backend = "mamba2"
+        elif (not want2) and _HAS_MAMBA1:
+            backend = "mamba1"
+        elif _HAS_MAMBA2:
+            backend = "mamba2"
+        elif _HAS_MAMBA1:
+            backend = "mamba1"
+        else:
+            backend = "torch_scan"
+
+        # Mamba-2 runs a larger state dim well (matmul path); Mamba-1 favors 16.
+        ds = d_state if d_state is not None else (64 if backend == "mamba2" else 16)
 
         def make_block():
-            if use_fast:
-                return _FastMamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-            return MambaBlockTorch(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            if backend == "mamba2":
+                return _Mamba2(d_model=d_model, d_state=ds, d_conv=d_conv,
+                               expand=expand, headdim=headdim)
+            if backend == "mamba1":
+                return _Mamba1(d_model=d_model, d_state=ds, d_conv=d_conv, expand=expand)
+            return MambaBlockTorch(d_model, d_state=ds, d_conv=d_conv, expand=expand)
 
         self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_layers)])
         self.blocks = nn.ModuleList([make_block() for _ in range(num_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.predictor = nn.Linear(d_model, self.vocab_size)
-        self.backend = "mamba_ssm" if use_fast else "torch_scan"
+        self.backend = backend
 
     def forward(self, x):
         B, T = x.size()
@@ -122,14 +154,18 @@ def build_backbone(name="transformer", **kwargs):
     """Factory so training/eval can A/B by name. 'transformer' imports the
     existing NetworkBytePatcher; 'mamba' returns MambaBytePatcher.
     NOTE: Mamba ignores nhead; transformer ignores d_state/d_conv/expand."""
-    if name == "mamba":
+    if name in ("mamba", "mamba1", "mamba2"):
+        variant = "mamba1" if name == "mamba1" else "mamba2" if name == "mamba2" \
+            else kwargs.get("variant", "mamba2")
         return MambaBytePatcher(
             d_model=kwargs.get("d_model", 128),
             num_layers=kwargs.get("num_layers", 2),
             max_sequence_length=kwargs.get("max_sequence_length", 512),
-            d_state=kwargs.get("d_state", 16),
+            d_state=kwargs.get("d_state", None),
             d_conv=kwargs.get("d_conv", 4),
             expand=kwargs.get("expand", 2),
+            variant=variant,
+            headdim=kwargs.get("headdim", 64),
             force_torch_scan=kwargs.get("force_torch_scan", False),
         )
     from src.model import NetworkBytePatcher

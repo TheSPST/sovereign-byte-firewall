@@ -64,7 +64,8 @@ from src.dataloader import get_pcap_dataloader
 def parse_args():
     parser = argparse.ArgumentParser(description="Zero-day proof-of-work evaluation harness")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/latest_patcher.pt")
-    parser.add_argument("--backbone", type=str, default=None, choices=[None, "transformer", "mamba"],
+    parser.add_argument("--backbone", type=str, default=None,
+                        choices=[None, "transformer", "mamba", "mamba1", "mamba2"],
                         help="Override the model backbone (default: read from checkpoint, else transformer)")
     parser.add_argument("--benign_calibration_pcap", type=str, default="scratch/archive_upload/normal.pcap",
                          help="Benign traffic used to fit the threshold (label=0)")
@@ -133,15 +134,18 @@ def load_model(checkpoint_path, device, override_seq_len=None, backbone=None):
     # Backbone: explicit arg > value stored in the checkpoint > transformer default.
     backbone = backbone or checkpoint.get("backbone", "transformer")
 
-    if backbone == "mamba":
+    if backbone in ("mamba", "mamba1", "mamba2"):
         # Mamba has no positional embedding; take config from the checkpoint (saved
         # by train_ab.py), falling back to the eval's override / defaults.
         from src.model_mamba import MambaBytePatcher
+        variant = "mamba1" if backbone == "mamba1" else "mamba2" if backbone == "mamba2" \
+            else checkpoint.get("variant", "mamba2")
         checkpoint_max_seq_len = checkpoint.get("max_sequence_length", override_seq_len or 512)
         model = MambaBytePatcher(
             d_model=checkpoint.get("d_model", 128),
             num_layers=checkpoint.get("num_layers", 2),
             max_sequence_length=checkpoint_max_seq_len,
+            variant=variant,
         ).to(device)
     else:
         pos_weight = state_dict.get("pos_embedding.weight")

@@ -43,7 +43,8 @@ from src.model_mamba import build_backbone
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--backbone", choices=["transformer", "mamba"], required=True)
+    p.add_argument("--backbone", choices=["transformer", "mamba1", "mamba2"], required=True,
+                   help="mamba2 = SSD/matmul-optimized (faster on GPU, recommended)")
     p.add_argument("--train_pcap", required=True, help="Benign training corpus (e.g. Monday)")
     p.add_argument("--out", required=True, help="Output checkpoint path")
     p.add_argument("--steps", type=int, default=20000)

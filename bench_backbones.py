@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model import NetworkBytePatcher
-from src.model_mamba import MambaBytePatcher, _HAS_MAMBA_SSM
+from src.model_mamba import MambaBytePatcher, _HAS_MAMBA1, _HAS_MAMBA2
 
 
 def params(m):
@@ -72,8 +72,9 @@ def build(name, d_model, layers, seq_len):
     if name == "transformer":
         return NetworkBytePatcher(d_model=d_model, nhead=4, num_layers=layers,
                                   max_sequence_length=seq_len)
+    variant = "mamba2" if name == "mamba2" else "mamba1"
     return MambaBytePatcher(d_model=d_model, num_layers=layers,
-                            max_sequence_length=seq_len)
+                            max_sequence_length=seq_len, variant=variant)
 
 
 def main():
@@ -88,34 +89,43 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else
                           ("mps" if torch.backends.mps.is_available() else "cpu"))
-    print(f"Device: {device} | Mamba backend: {'mamba_ssm (fused)' if _HAS_MAMBA_SSM else 'torch_scan (slow fallback)'}")
-    if not _HAS_MAMBA_SSM:
-        print("  WARNING: install mamba-ssm + causal-conv1d for a fair speed test on GPU.\n")
+    print(f"Device: {device} | Mamba-1 kernel: {_HAS_MAMBA1} | Mamba-2 (SSD) kernel: {_HAS_MAMBA2}")
+    if not (_HAS_MAMBA1 or _HAS_MAMBA2):
+        print("  WARNING: install mamba-ssm + causal-conv1d for a fair speed test on GPU.")
+
+    # Backbones to compare: transformer + whichever Mamba kernels are present.
+    names = ["transformer"]
+    if _HAS_MAMBA1:
+        names.append("mamba1")
+    if _HAS_MAMBA2:
+        names.append("mamba2")
+    if len(names) == 1:
+        names.append("mamba1")  # torch_scan fallback, so at least one Mamba shows
 
     max_seq = max(args.seq_lens)
-    tfm = build("transformer", args.d_model, args.layers, max_seq)
-    mmb = build("mamba", args.d_model, args.layers, max_seq)
-    print(f"Params: transformer {params(tfm):,} | mamba {params(mmb):,} "
-          f"({params(mmb)/params(tfm):.2f}x)\n")
+    models = {n: build(n, args.d_model, args.layers, max_seq) for n in names}
+    pstr = " | ".join(f"{n} {params(m):,} ({params(m)/params(models['transformer']):.2f}x)"
+                      for n, m in models.items())
+    print(f"Params: {pstr}\n")
 
-    print(f"{'seq_len':>8} | {'backbone':>11} | {'windows/sec':>12} | {'ms/batch':>9}")
-    print("-" * 52)
-    results = {}
+    print(f"{'seq_len':>8} | {'backbone':>11} | {'windows/sec':>12} | {'ms/batch':>9} | {'vs tfm':>7}")
+    print("-" * 62)
     for L in args.seq_lens:
-        for name, model in (("transformer", tfm), ("mamba", mmb)):
-            wps, mspb = bench_forward(model, device, L, args.batch, args.steps)
-            results[(L, name)] = wps
-            print(f"{L:>8} | {name:>11} | {wps:>12,.0f} | {mspb:>9.2f}")
-        speedup = results[(L, "mamba")] / max(1e-9, results[(L, "transformer")])
-        print(f"{'':>8} | {'-> mamba/tfm':>11} | {speedup:>11.2f}x |")
+        base = None
+        for n in names:
+            wps, mspb = bench_forward(models[n], device, L, args.batch, args.steps)
+            if n == "transformer":
+                base = wps
+            sp = f"{wps/base:.2f}x" if base else "-"
+            print(f"{L:>8} | {n:>11} | {wps:>12,.0f} | {mspb:>9.2f} | {sp:>7}")
+        print("-" * 62)
     print()
 
     print("Learning sanity check (periodic pattern, loss should drop):")
-    for name, model in (("transformer", build("transformer", args.d_model, args.layers, max_seq)),
-                        ("mamba", build("mamba", args.d_model, args.layers, max_seq))):
-        f_, l_ = learn_check(model, device, 256, args.learn_steps)
+    for n in names:
+        f_, l_ = learn_check(build(n, args.d_model, args.layers, max_seq), device, 256, args.learn_steps)
         ok = "OK" if l_ < f_ * 0.5 else "?? (loss did not halve)"
-        print(f"  {name:>11}: loss {f_:.3f} -> {l_:.3f}   {ok}")
+        print(f"  {n:>11}: loss {f_:.3f} -> {l_:.3f}   {ok}")
 
     print("\nRead: if mamba matches accuracy (separate eval) at higher windows/sec,")
     print("especially as seq_len grows, the edge/pre-filter economics favor it.")
