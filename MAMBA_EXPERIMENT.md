@@ -62,7 +62,27 @@ variant="mamba2")` (default), `build_backbone("mamba2"|"mamba1")`, `train_ab.py
 now benchmarks transformer vs mamba1 vs mamba2 side by side (whichever kernels are
 installed). Re-run the benchmark to get the Mamba-2 speedup vs the 1.85x below.
 
-## Mamba-2 result (2026-07-18, Kaggle GPU, both kernels present) — did NOT beat Mamba-1 at our scale
+## VARIANT VERDICT: use Mamba-2. Two regimes tested.
+**Small config (d_model 128, d_state 64, ~300k params) — our production scale:**
+mamba1 and mamba2 are ~tied, both **~1.4x (seq512) to ~1.85x (seq2048) faster than
+the transformer** at ~0.41x params. This is the number that matters for us.
+
+**Large config (d_model 256, d_state 128, ~1-1.3M params):** here Mamba-2's SSD
+advantage over Mamba-1 is decisive — **Mamba-2 ~2.5x faster than Mamba-1** at every
+seq len (512: 1074 vs 430; 2048: 263 vs 107; 4096: 127 vs 52 win/s) AND smaller
+(1.06M vs 1.35M). Mamba-1's scan scales badly with d_state and collapses to
+0.28-0.54x the transformer; Mamba-2's matmul path handles large state well.
+
+**But vs the transformer, scaling the model UP does not help speed:** at the large
+config the transformer is faster at short seq; Mamba-2 only overtakes it at seq
+4096 (1.31x). Crossover moves to longer seq as the model grows.
+
+**Conclusions:** (1) **Mamba-2 is the variant** — never worse than Mamba-1, far
+better at large d_state. (2) Keep the model **small** (d_model 128) for the speed
+win vs the transformer; don't scale up for throughput. (3) The remaining gate is
+still ACCURACY (train + held-out eval) — use Mamba-2, small config, for the A/B.
+
+## Mamba-2 result (2026-07-18, small config) — tied with Mamba-1 at our scale
 | seq_len | transformer | mamba1 | mamba2 |
 |---|---|---|---|
 | 512  | 1.00x | **1.40x** | 1.14x |
