@@ -60,6 +60,14 @@ depends on.
 - Mixed → test a longer context (where Mamba's linear scaling wins more) before
   deciding.
 
+## Note on capacity (fairness)
+At d_model=128 / 2 layers the Mamba comes out **~300k params — roughly 5× SMALLER
+than the transformer (~1.6M)** (no attention QKV/MLP, no positional embedding).
+For a fair *accuracy* A/B, either match capacity (raise the Mamba's d_model or
+num_layers to ~1.6M params) or report the accuracy-per-parameter and
+accuracy-per-FLOP honestly. If the smaller Mamba already matches the transformer,
+that is itself a strong result for the edge story.
+
 Same discipline as the n-gram ablation: an experiment with a written decision
 rule, not an assumption. Do NOT merge to `main` until the A/B is run and the
 verdict favors it.

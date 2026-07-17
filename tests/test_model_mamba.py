@@ -61,9 +61,11 @@ def test_backend_flag_and_factory():
 
 
 def test_param_count_reasonable():
-    """Sanity: a 2-layer d128 Mamba is in the same lightweight ballpark as the
-    transformer (~1-2M params), not orders of magnitude larger."""
+    """Sanity: a 2-layer d128 Mamba is lightweight. It actually comes out ~5x
+    SMALLER than the transformer (~300k vs ~1.6M) -- no attention QKV/MLP, no
+    positional embedding. Note for the A/B: to compare accuracy fairly you may
+    want to match capacity (raise d_model/num_layers on the Mamba side)."""
     m = MambaBytePatcher(d_model=128, num_layers=2, max_sequence_length=512,
                          force_torch_scan=True)
     n = sum(p.numel() for p in m.parameters())
-    assert 0.3e6 < n < 5e6, f"unexpected param count {n}"
+    assert 0.1e6 < n < 5e6, f"unexpected param count {n}"
