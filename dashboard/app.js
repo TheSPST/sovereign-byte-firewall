@@ -77,7 +77,9 @@ function formatEnrichment(e) {
     if (!e || Object.keys(e).length === 0) return '';
     const parts = [];
     if (e.top_talkers && e.top_talkers.length) {
-        parts.push('talkers: ' + e.top_talkers.map(t => t.pair).join(', '));
+        // talkers may be [{pair,bytes}] (incidents) or ["a -> b"] (meta summary)
+        const names = e.top_talkers.map(t => (typeof t === 'string' ? t : t.pair));
+        parts.push('talkers: ' + names.join(', '));
     }
     if (e.top_ports && e.top_ports.length) parts.push('ports: ' + e.top_ports.join('/'));
     if (e.proto_mix_pct) {
@@ -85,6 +87,8 @@ function formatEnrichment(e) {
     }
     if (typeof e.syns === 'number' && e.syns > 0) parts.push(e.syns + ' SYN');
     if (typeof e.score_percentile === 'number') parts.push(e.score_percentile + 'th pct');
+    if (typeof e.cusum_level === 'number') parts.push('cumulative ' + e.cusum_level + ' bits');
+    if (typeof e.drift_psi === 'number') parts.push('drift PSI ' + e.drift_psi);
     return parts.join('  •  ');
 }
 
