@@ -118,10 +118,19 @@ def inventory():
 # Step 2: load attack flows from ground truth
 # ---------------------------------------------------------------------------
 def load_attack_flows(gt_csvs):
-    """Returns {(srcip,sport,dstip,dsport,proto_num): [(stime, ltime, cat), ...]}
-    for label=1 rows, keyed in BOTH directions."""
+    """Parse label=1 rows into three matchers of decreasing strictness:
+      flows        : (sip,sport,dip,dport,proto) -> [(st,lt,cat)] (both directions)
+      attack_pairs : frozenset({sip,dip})        -> [(st,lt,cat)]
+      attacker_ips : set of source IPs that appear in ANY attack row
+    UNSW-NB15 note: the GT Stime/Ltime clock frequently does NOT align with the
+    pcap capture clock, so time-window matching alone silently drops everything.
+    The attacker IPs (e.g. 175.45.176.x) only ever generate attack traffic, so
+    5-tuple / IP-pair matching is safe and robust when time fails."""
     flows = defaultdict(list)
+    attack_pairs = defaultdict(list)
+    attacker_ips = set()
     n = 0
+    st_min, st_max = None, None
     for path in gt_csvs:
         with open(path, newline="", encoding="utf-8", errors="replace") as f:
             for row in csv.reader(f):
@@ -141,18 +150,30 @@ def load_attack_flows(gt_csvs):
                 span = (st - 1, lt + 1, cat)
                 flows[(sip, sport, dip, dport, proto)].append(span)
                 flows[(dip, dport, sip, sport, proto)].append(span)
+                attack_pairs[frozenset((sip, dip))].append(span)
+                attacker_ips.add(sip)
                 n += 1
-    print(f"Loaded {n} attack flows across {len(flows)} directional 5-tuples")
+                st_min = st if st_min is None else min(st_min, st)
+                st_max = st if st_max is None else max(st_max, st)
+    print(f"Loaded {n} attack flows across {len(flows)} directional 5-tuples, "
+          f"{len(attack_pairs)} IP-pairs, {len(attacker_ips)} attacker IPs")
+    if st_min is not None:
+        print(f"  GT attack time range: {st_min}..{st_max}")
     if n == 0:
         fail("Ground-truth CSVs contained no label=1 rows - wrong files?")
-    return flows
+    return flows, attack_pairs, attacker_ips
 
 
 # ---------------------------------------------------------------------------
 # Step 3: split raw pcap chunks into benign / per-category attack pcaps
 # ---------------------------------------------------------------------------
-def split_pcaps(pcaps, flows):
+def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
     import dpkt
+
+    # MATCH_MODE: how strict to be. Default "auto" = try 5-tuple/pair with time,
+    # but if the pcap/GT clocks don't overlap, fall back to time-agnostic
+    # 5-tuple/pair matching (the robust choice for UNSW-NB15).
+    mode = os.environ.get("MATCH_MODE", "auto").lower()
 
     def open_reader(fh, path):
         try:
@@ -161,7 +182,7 @@ def split_pcaps(pcaps, flows):
             fh.seek(0)
             return dpkt.pcapng.Reader(fh)
 
-    out = {}   # name -> (writer, filehandle, count)
+    out = {}   # name -> [writer, filehandle, count]
     def writer(name):
         if name not in out:
             fh = open(os.path.join(WORK, f"{name}.pcap"), "wb")
@@ -169,41 +190,89 @@ def split_pcaps(pcaps, flows):
         return out[name]
 
     stats = defaultdict(int)
+    diag = defaultdict(int)  # 5tuple_hit, 5tuple_time_hit, pair_hit, ip_hit
+    pcap_ts_min, pcap_ts_max = None, None
+
+    def categorize(key, pair, sip, dip, t, use_time):
+        """Return attack category or None."""
+        if key is not None and key in flows:
+            diag["5tuple_hit"] += 1
+            spans = flows[key]
+            if use_time:
+                for st, lt, c in spans:
+                    if st <= t <= lt:
+                        diag["5tuple_time_hit"] += 1
+                        return c
+            else:
+                return spans[0][2]
+        if pair in attack_pairs:
+            diag["pair_hit"] += 1
+            spans = attack_pairs[pair]
+            if use_time:
+                for st, lt, c in spans:
+                    if st <= t <= lt:
+                        return c
+            else:
+                return spans[0][2]
+        return None
+
     for ci, path in enumerate(pcaps[:MAX_PCAPS]):
         benign_name = f"benign_{ci}"
         print(f"[{ci+1}/{min(len(pcaps), MAX_PCAPS)}] splitting {path} ...")
+        # Two-condition parse buffer so we can decide time-usefulness once.
+        parsed = []  # (ts, buf, key, pair, sip, dip)
         with open(path, "rb") as fh:
             try:
                 rd = open_reader(fh, path)
             except Exception as e:
                 print(f"  SKIP (unreadable: {e})"); continue
             for ts, buf in rd:
-                key = None
+                key = pair = sip = dip = None
                 try:
                     eth = dpkt.ethernet.Ethernet(buf)
                     ip = eth.data
                     if isinstance(ip, dpkt.ip.IP) and isinstance(ip.data, (dpkt.tcp.TCP, dpkt.udp.UDP)):
                         l4 = ip.data
-                        key = (socket.inet_ntoa(ip.src), l4.sport,
-                               socket.inet_ntoa(ip.dst), l4.dport, ip.p)
+                        sip = socket.inet_ntoa(ip.src); dip = socket.inet_ntoa(ip.dst)
+                        key = (sip, l4.sport, dip, l4.dport, ip.p)
+                        pair = frozenset((sip, dip))
                 except Exception:
                     pass
-                cat = None
-                if key is not None and key in flows:
-                    t = int(ts)
+                t = int(ts)
+                pcap_ts_min = t if pcap_ts_min is None else min(pcap_ts_min, t)
+                pcap_ts_max = t if pcap_ts_max is None else max(pcap_ts_max, t)
+                parsed.append((ts, buf, key, pair, sip, dip, t))
+
+        # Decide whether to use the time window: only if any 5-tuple/pair key
+        # exists AND at least one time-window hit occurs on a sample.
+        use_time = (mode == "strict")
+        if mode == "auto":
+            time_hits = 0
+            for (ts, buf, key, pair, sip, dip, t) in parsed:
+                if key in flows:
                     for st, lt, c in flows[key]:
                         if st <= t <= lt:
-                            cat = c
-                            break
-                if cat is not None:
-                    w = writer(f"attack_{cat}")
-                    if w[2] < MAX_ATTACK_PKTS:
-                        w[0].writepkt(buf, ts); w[2] += 1
-                    stats[cat] += 1
-                else:
-                    w = writer(benign_name)
+                            time_hits += 1; break
+                if time_hits >= 5:
+                    break
+            use_time = time_hits >= 5
+            verdict = "USABLE" if use_time else "NOT usable (clock mismatch) -> time-agnostic 5-tuple/IP-pair matching"
+            print(f"  MATCH_MODE=auto: time-window {verdict}")
+
+        for (ts, buf, key, pair, sip, dip, t) in parsed:
+            cat = categorize(key, pair, sip, dip, t, use_time)
+            if cat is not None:
+                w = writer(f"attack_{cat}")
+                if w[2] < MAX_ATTACK_PKTS:
                     w[0].writepkt(buf, ts); w[2] += 1
-                    stats["benign"] += 1
+                stats[cat] += 1
+            else:
+                w = writer(benign_name)
+                w[0].writepkt(buf, ts); w[2] += 1
+                stats["benign"] += 1
+
+    print(f"  pcap time range: {pcap_ts_min}..{pcap_ts_max}")
+    print(f"  match diagnostics: {dict(diag)}")
     for name, (w, fh, cnt) in out.items():
         fh.close()
         print(f"  wrote {WORK}/{name}.pcap  ({cnt} packets)")
@@ -251,8 +320,8 @@ def main():
         print("[WARN] Only one pcap chunk: benign holdout will come from the same chunk "
               "(weaker split). Attach 2+ chunks if possible.")
 
-    flows = load_attack_flows(gt_csvs)
-    benign, attacks = split_pcaps(pcaps, flows)
+    flows, attack_pairs, attacker_ips = load_attack_flows(gt_csvs)
+    benign, attacks = split_pcaps(pcaps, flows, attack_pairs, attacker_ips)
 
     if not benign:
         fail("No benign packets extracted - check ground truth / pcap pairing.")
