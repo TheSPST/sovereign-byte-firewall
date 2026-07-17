@@ -1,16 +1,60 @@
 # Product Roadmap — Daemon & Dashboard Workflow Features
 **Created: 2026-07-17 · Companion to `roadmap.md` (research) and `PROJECT_REPORT_2026-07-16.md` (GTM)**
 
-Guiding rule: nothing here may displace the outreach critical path
-(live-FP measurement → UNSW eval → brief → outreach). Phase 1 ships before
-outreach because it strengthens the pilot deliverable; Phase 2 is demo
-polish; Phase 3 waits for a first pilot's real-world feedback.
+Guiding rule: nothing here may displace the outreach critical path. UNSW eval
+is done; the only remaining outreach blocker is the live-FP number. Everything
+below is re-cut around that — **Phase 0 is the minimal outreach-ready sprint**
+(low-effort, high-outreach-impact only); every heavier item is explicitly
+deferred to *after a pilot is agreed*, so we don't gold-plate before we have a
+customer.
 
 ---
 
-## Phase 1 — Evidence in every alert (~1.5 days, pre-outreach)
+## Phase 0 — Outreach-Ready sprint (do these first, ~2 days + the FP wait)
 
-### 1.1 One-click PCAP context (highest value/effort ratio)
+The single question this phase answers: *what is the minimum that makes the
+demo compelling and the brief complete enough to start sending emails?*
+Nothing here is speculative build; each item is hours, not days.
+
+### 0.1 Finish the live-FP run + fill placeholders — *0 dev, just wait + edit*
+Let the daemon (now on alert-budget calibration) run ~overnight; compute
+incidents/day from `incidents_<iface>.csv`; drop the number into the `[LIVE_FP]`
+slots in `TECHNICAL_BRIEF.md`, `README.md`, `OUTREACH.md`. **This is the last
+outreach blocker.**
+
+### 0.2 Push everything + tag v0.1.0 — *~15 min*
+`git push` the full session; tag `v0.1.0` pinned to the v2 gs75000 checkpoint
+with the reproducible eval command in the tag message. Gives outreach a stable
+reference to point at.
+
+### 0.3 Deterministic incident enrichment — *~half day* — makes alerts legible
+Every incident carries computed facts, not just a score: top talkers
+(src→dst by bytes), ports, protocol mix, SYN rate, and score percentile vs. the
+saved baseline ("14.4 bits — 99.98th pct of this network"). No LLM, no
+hallucination. Emit as WS payload + CSV columns. *Detail in 1.2 below.*
+**Why now:** an alert a non-ML analyst can read is table stakes for the demo
+and the pilot report; it's a few hours of work.
+
+### 0.4 Per-byte surprise heatmap in the dashboard — *~half–1 day* — the demo moment
+The single best CISO-demo asset, and the per-byte `surprise_bits` array
+already exists in the daemon. Render the flagged window as a byte grid with
+surprising bytes glowing red. *Detail in 2.1 below.*
+**Why now:** turns an abstract score into "here's exactly what the model saw" —
+the thing that makes a 2-minute video land.
+
+### 0.5 Record the 2-minute demo video — *~half day* — the outreach attachment
+Replay a CIC attack pcap through the daemon → dashboard lights up → heatmap
+shows the anomalous bytes → incident is legible. Screen capture, no narration
+needed. This is the asset every outreach email/DM/post links to.
+
+**Phase 0 done = ready to send.** Brief complete, demo recorded, repo tagged.
+Do NOT start Phase 1+ until the first batch of outreach is out.
+
+---
+
+## Deferred until a pilot is agreed (was Phase 1 — pilot deliverable polish)
+
+### 1.1 One-click PCAP context — *~1 day* — DEFER (strong pilot feature, not needed to send the first email)
 Analysts live in Wireshark; hand them the exact packets.
 
 **Implementation** (`firewall_daemon.py`):
@@ -26,38 +70,31 @@ Analysts live in Wireshark; hand them the exact packets.
 **Acceptance:** replay a CIC attack pcap against the daemon → flagged
 incident produces a .pcap openable in Wireshark containing the offending
 window ±5s. Buffer overhead <100 MB RSS.
+**Why deferred:** high value *once a pilot is running*, but the first outreach
+email doesn't need it. Build the week a pilot says yes.
 
-### 1.2 Deterministic incident enrichment (no LLM, no hallucination)
-Every incident carries computed facts, not just a score:
-
-- Top talkers in the window (src→dst pairs by bytes), ports involved,
-  protocol mix (TCP/UDP/other %), SYN rate at the time.
-- Score context: "13.4 bits — 99.97th percentile of this network's baseline"
-  (percentile from the saved calibration distribution — store score
-  histogram in `calibration_<iface>.json` at calibration time).
-- Emit as extra fields in the WS payload + CSV columns.
-
-**Acceptance:** alert message readable by a non-ML analyst; CSV row is
-self-contained enough to triage without opening the pcap.
+### 1.2 Deterministic incident enrichment — pulled into Phase 0.3 (full spec below)
+Every incident carries computed facts, not just a score: top talkers (src→dst
+by bytes), ports, protocol mix (TCP/UDP/other %), SYN rate, and score
+percentile vs. the saved baseline ("14.4 bits — 99.98th pct"; store the score
+histogram in `calibration_<iface>.json` at calibration time). Emit as WS payload
++ CSV columns. No LLM, no hallucination.
+**Acceptance:** an alert a non-ML analyst can read; CSV row self-contained
+enough to triage without opening the pcap.
 
 ---
 
-## Phase 2 — Show, don't tell (~2–3 days, demo polish before/during outreach)
+## Phase 2 — Show, don't tell (demo polish)
 
-### 2.1 Per-byte surprise heatmap ("what the model saw")
-The single best CISO-demo asset: flagged window rendered as a hex/byte grid,
-surprising bytes glowing red on a cool background.
-
-**Implementation:**
-- Daemon already computes `surprise_bits` per byte (shape [1, 511]) — on
-  incident open, attach the top-scoring window's byte values + surprise
-  array (quantized to uint8 0–255 scale) to the WS payload (~1 KB).
-- Dashboard: new pane, `<canvas>` grid (32×16), color = surprise percentile
-  vs calibration mean; hover shows offset/byte value/bits. Pure JS, no deps.
-
-**Acceptance:** during a replayed Heartbleed capture, the heatmap visibly
-lights up on the anomalous region; on marginal benign exceedances it shows
-diffuse low-grade red (which is itself an honest triage signal).
+### 2.1 Per-byte surprise heatmap — pulled into Phase 0.4 (full spec below)
+The single best CISO-demo asset: flagged window rendered as a byte grid,
+surprising bytes glowing red. The daemon already computes `surprise_bits` per
+byte (shape [1, 511]); on incident open, attach the top-scoring window's byte
+values + surprise array (quantized) to the WS payload (~1 KB). Dashboard renders
+a `<canvas>` grid (32×16), colour = surprise percentile vs calibration mean,
+hover shows offset/byte/bits. Pure JS, no deps.
+**Acceptance:** on a replayed Heartbleed capture the heatmap lights up on the
+anomalous region; on marginal benign exceedances it shows diffuse low-grade red.
 
 ### 2.2 Triage-grade dashboard
 Upgrade `dashboard/` from alert ticker to incident manager:
@@ -165,7 +202,14 @@ then does the brief mention line-rate scale.
 
 | When | GTM track (critical path) | Product track (this doc) |
 |---|---|---|
-| Jul 17–19 | FP measurement accumulating; UNSW eval on quota reset | Phase 1 (pcap context + enrichment) |
-| Jul 20–24 | Brief finalized with both numbers; iDEX/MeitY applications | Phase 2 (heatmap + triage dashboard) |
-| Jul 25–31 | MSSP outreach with demo video | Record demo video using Phase 2 UI |
-| Aug | Pilot negotiation | Phase 3 only if a pilot demands it |
+| Jul 17–18 | Live-FP run finishing (last brief placeholder) | **Phase 0.1–0.2** (fill FP, push, tag v0.1.0) |
+| Jul 19–21 | Brief + outreach copy finalized | **Phase 0.3–0.5** (enrichment, heatmap, demo video) |
+| Jul 22–25 | **Send:** MSSP emails + iDEX/MeitY applications + warm DMs | — (outreach out; no new build) |
+| Jul 26–31 | First replies / calls | 1.1 pcap-context only if a call asks for it |
+| Aug | Pilot agreed → build pilot deliverables | Deferred Phase 1/2.2 (pilot polish), then Phase H hardening |
+| Post-pilot | Renewal / enterprise features | Phase 3 (LLM triage), Phase H.1–H.5 |
+
+**The cut:** Phase 0 is ~2 days of work plus the FP wait, and it's everything
+needed to *start* selling. Triage dashboard (2.2), pcap-on-alert (1.1), LLM
+(3.x), and all Phase H hardening wait until a real customer pulls them —
+building them now is gold-plating a product nobody has bought yet.
