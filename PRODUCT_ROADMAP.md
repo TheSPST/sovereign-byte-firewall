@@ -187,6 +187,15 @@ the model — the cheapest strong adversarial defense).
 **Acceptance:** an invariant fires on a crafted low-surprise payload that the
 byte model rates benign.
 
+### H.6 Hourly meta-event summary + drift surface — *~2 days* — fatigue + drift
+Roll all incidents in a rolling 1-hour window into one meta-event (count,
+severity spread, top talkers/ports, steady-state vs spike), emitted to the
+dashboard + `meta_events.csv`. This is also where concept-drift detection lives:
+compare the hour's score distribution to the calibration baseline (PSI/KL) and
+flag "baseline stale" instead of a false-alarm storm. Builds on IncidentAggregator.
+See `V2_AND_DISTRIBUTION.md` A.2. Pairs with H.2 (drift) and feeds a future
+LLM digest.
+
 ### H.5 XDP throughput benchmark → then Mamba backbone — *~2 days bench, Mamba ~1–2 wks* — answers line-rate
 Before any line-rate claim, measure the **steer-down ratio** and sustained
 windows/sec + Mbps on real traffic (M2 Pro CPU/MPS and one A100). Prototype the
