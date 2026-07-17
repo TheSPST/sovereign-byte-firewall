@@ -198,6 +198,33 @@ then does the brief mention line-rate scale.
 
 ---
 
+## Validation experiments (decision-driving, not features)
+
+### V.1 Byte n-gram baseline — *~2–3 hrs to run* — does the transformer earn its complexity?
+**Question:** a cheap order-K byte n-gram also produces a next-byte surprise
+score. If it matches the transformer on the same held-out zero-day protocol,
+the transformer is over-engineered. **Built and unit-tested:** `ngram_baseline.py`
+(same pcaps, same masking via `get_pcap_dataloader`, same topk-10% aggregation,
+same benign-calibration / held-out-attack split — only the scorer differs).
+**Run it on the split we already have cached** (UNSW Shellcode + Exploits, and
+CIC) and compare AUC / held-out detection @ ~1% FPR to the transformer:
+```
+python ngram_baseline.py --benign_calibration_pcap unsw_work/benign_0.pcap \
+  --benign_holdout_pcap unsw_work/benign_1_sub.pcap \
+  --attack_dir unsw_work/calib_attacks \
+  --holdout_attack_pcap unsw_work/attack_shellcode.pcap --order 3 --topk_frac 0.1
+```
+Sweep `--order 2,3,4,5`. **Decision rule:**
+- n-gram within ~2 pts of the transformer → transformer NOT justified at current
+  scale; shrink the model or simplify.
+- transformer beats n-gram by >~5 pts → complexity justified; cite this ablation
+  in technical due diligence (a reviewer *will* ask).
+- middle → run a larger order + a Mamba backbone before deciding.
+**Why it matters:** this is the sharpest "why not something simpler?" question,
+and right now we can't answer it. The experiment settles it cheaply.
+
+---
+
 ## Sequencing vs. GTM (July–August 2026)
 
 | When | GTM track (critical path) | Product track (this doc) |
