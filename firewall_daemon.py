@@ -73,6 +73,10 @@ def parse_args():
                         help="Fraction of bytes (by surprise, highest first) averaged into the window score (default 0.1, matching the validated eval recipe)")
     parser.add_argument("--learning_time", type=int, default=0,
                         help="Calibrate on benign traffic for X seconds, save threshold, then go LIVE automatically (0 = Disabled)")
+    parser.add_argument("--target_incidents_per_hour", type=float, default=1.0,
+                        help="Alert budget: pick the calibration threshold that yields at most this many "
+                             "byte-alerts/hour on the benign baseline (0 = fall back to the 99.9th-percentile / "
+                             "mean+3sigma rule). Actual incidents are <= this after dedup.")
     parser.add_argument("--rate_threshold", type=int, default=75, help="SYN rate threshold per 100ms window")
     parser.add_argument("--dedup_window", type=float, default=60.0,
                         help="Collapse repeated alerts of the same type within this many seconds into one incident (0 = disable)")
@@ -107,31 +111,61 @@ def load_calibration(interface):
             logging.warning(f"Could not read {path}: {e}")
     return None
 
-def save_calibration(interface, scores_tensor):
-    """Derive a robust threshold from benign scores and persist it.
+def save_calibration(interface, scores_tensor, elapsed_seconds=0.0, target_iph=0.0):
+    """Derive a per-environment threshold from benign scores and persist it.
 
-    Uses the 99.9th percentile (robust to a few outlier windows) and keeps
-    mean+3*std as a reference. Returns the calibration dict.
+    If target_iph > 0 (an alert budget in byte-alerts/hour), the threshold is
+    the score quantile that yields that many benign exceedances/hour given the
+    measured window throughput - i.e. you tell it how many alerts/hour you can
+    tolerate and it sets the bar. Raw exceedances upper-bound incidents (dedup
+    only reduces them), so real incidents/hour <= target.
+
+    If target_iph <= 0, falls back to max(99.9th percentile, mean+3*std).
     """
     quantile_thr = torch.quantile(scores_tensor, 0.999).item()
     mean_val = scores_tensor.mean().item()
     std_val = scores_tensor.std().item() if scores_tensor.numel() > 1 else 0.0
     sigma_thr = mean_val + 3 * std_val
+    n = int(scores_tensor.numel())
+
+    window_rate = (n / elapsed_seconds) if elapsed_seconds > 0 else 0.0  # windows/sec
+    budget_thr = None
+    budget_q = None
+    if target_iph > 0 and window_rate > 0:
+        windows_per_hour = window_rate * 3600.0
+        frac = target_iph / windows_per_hour           # fraction of windows allowed over the bar
+        frac = min(max(frac, 1e-6), 0.5)               # clamp to a sane range
+        budget_q = 1.0 - frac
+        budget_thr = torch.quantile(scores_tensor, budget_q).item()
+
+    if budget_thr is not None:
+        threshold = budget_thr
+        method = f"alert-budget ({target_iph:g}/hr -> q{budget_q:.5f})"
+    else:
+        threshold = max(quantile_thr, sigma_thr)
+        method = "max(q99.9, mean+3sigma)"
+
     calib = {
         "interface": interface,
         "score_metric": SCORE_METRIC,
-        "byte_threshold": max(quantile_thr, sigma_thr),
+        "byte_threshold": threshold,
+        "threshold_method": method,
+        "target_incidents_per_hour": target_iph,
+        "window_rate_per_sec": round(window_rate, 3),
+        "budget_quantile": budget_q,
+        "budget_threshold": budget_thr,
         "quantile_999": quantile_thr,
         "mean_plus_3sigma": sigma_thr,
         "mean": mean_val,
         "std": std_val,
-        "num_windows": int(scores_tensor.numel()),
+        "num_windows": n,
+        "elapsed_seconds": round(elapsed_seconds, 1),
         "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     path = calibration_path(interface)
     with open(path, "w") as f:
         json.dump(calib, f, indent=2)
-    logging.info(f"Calibration saved to {path}")
+    logging.info(f"Calibration saved to {path} (method: {method})")
     return calib
 
 
@@ -233,14 +267,19 @@ def sniff_thread(args, device, model, masker):
             logging.error(f"Only {len(learning_scores)} windows seen during calibration - not enough. "
                           "Staying in calibration mode; generate more traffic.")
             return
-        calib = save_calibration(args.interface, torch.tensor(learning_scores))
+        elapsed = time.time() - learning_start
+        calib = save_calibration(args.interface, torch.tensor(learning_scores),
+                                 elapsed_seconds=elapsed, target_iph=args.target_incidents_per_hour)
         args.byte_threshold = calib["byte_threshold"]
         is_learning = False
         logging.info("=================================================")
         logging.info(f" CALIBRATION COMPLETE for '{args.interface}'")
-        logging.info(f" Windows: {calib['num_windows']} | Mean: {calib['mean']:.2f} | Std: {calib['std']:.2f}")
-        logging.info(f" q99.9: {calib['quantile_999']:.2f} | mean+3s: {calib['mean_plus_3sigma']:.2f}")
-        logging.info(f" -> LIVE with byte_threshold = {args.byte_threshold:.2f} <-")
+        logging.info(f" Windows: {calib['num_windows']} | Mean: {calib['mean']:.2f} | Std: {calib['std']:.2f} "
+                     f"| Rate: {calib['window_rate_per_sec']:.1f} win/s")
+        logging.info(f" Method: {calib['threshold_method']} | q99.9: {calib['quantile_999']:.2f} "
+                     f"| mean+3s: {calib['mean_plus_3sigma']:.2f}")
+        logging.info(f" -> LIVE with byte_threshold = {args.byte_threshold:.2f} "
+                     f"(budget {args.target_incidents_per_hour:g} alerts/hr) <-")
         logging.info("=================================================")
         trigger_alert_async("INFO", f"Calibration complete. LIVE with threshold {args.byte_threshold:.2f}")
 
