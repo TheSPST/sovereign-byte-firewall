@@ -133,7 +133,15 @@ def parse_args():
     parser.add_argument("--no_cusum", dest="enable_cusum", action="store_false",
                         help="Disable the CUSUM slow-low detector")
     parser.add_argument("--cusum_k_sigma", type=float, default=0.5,
-                        help="CUSUM slack allowance in units of benign sigma (default 0.5)")
+                        help="Fallback CUSUM reference = mean + k*sigma, used only if calibration "
+                             "has no score quantiles (default 0.5)")
+    parser.add_argument("--cusum_ref_pct", type=float, default=99.0,
+                        help="CUSUM reference = this benign percentile of surprise (default 99). "
+                             "Only flows persistently above it accumulate — keeps normal encrypted "
+                             "flows (mildly-elevated but < p99) from tripping it.")
+    parser.add_argument("--cusum_leak", type=float, default=0.98,
+                        help="CUSUM leak factor <1: drains bounded elevation so a near-reference "
+                             "flow can't slowly creep to an alarm (default 0.98)")
     parser.add_argument("--cusum_h", type=float, default=25.0,
                         help="CUSUM alarm bound in accumulated bits (default 25)")
     parser.add_argument("--summary_interval", type=float, default=3600.0,
@@ -311,36 +319,40 @@ class IncidentAggregator:
 # ---------------------------------------------------------------------------
 class CusumTracker:
     """Per-flow cumulative-sum change detector. For each host-pair key:
-        S = max(0, S + (x - (mu + k)))          # x = window surprise (bits)
-    alarm when S > h, then reset that flow's S to 0. Catches a persistent
-    host-pair whose windows are each BELOW the per-window alarm threshold but
-    consistently above the benign mean -- the memoryless detector's blind spot.
-    Bounded memory: stale flows evicted by TTL, hard-capped by LRU."""
+        S = max(0, leak*S + (x - reference))     # x = window surprise (bits)
+    alarm when S > h, then reset that flow's S to 0.
+
+    The REFERENCE is a HIGH benign quantile (default 99th pct), not mu+k: every
+    encrypted flow sits mildly above the global mean (its payload is masked, so
+    it's consistently a little surprising), so a mu-based reference would make
+    normal long-lived connections accumulate forever (observed live: benign
+    Google/QUIC flows tripping the alarm). Referencing the 99th percentile means
+    only a flow persistently in the benign top-1% tail accumulates. The LEAK
+    (<1) drains bounded elevation so a flow that hovers near the reference can't
+    slowly creep across h. Bounded memory: TTL evict + LRU cap."""
 
     MAX_FLOWS = 8192
 
-    def __init__(self, k_sigma=0.5, h=25.0, ttl=172800.0):
+    def __init__(self, k_sigma=0.5, h=25.0, ttl=172800.0, leak=0.98):
         self.k_sigma = k_sigma
         self.h = h
         self.ttl = ttl
-        self.mu = 0.0
-        self.sigma = 1.0
-        self.k = 0.0
+        self.leak = leak
+        self.reference = None
         self.enabled = False
         self.S = {}
         self.last_seen = {}
 
-    def set_baseline(self, mu, sigma):
-        self.mu = mu
-        self.sigma = max(1e-6, sigma)
-        self.k = self.k_sigma * self.sigma
+    def set_baseline(self, mu, sigma, reference=None):
+        # reference = high benign quantile (preferred). Fall back to mu + k*sigma.
+        self.reference = reference if reference is not None else mu + self.k_sigma * max(1e-6, sigma)
         self.enabled = True
 
     def update(self, key, x, now):
         """Feed one window's (flow_key, surprise). Returns (alarmed, level)."""
         if not self.enabled or key is None:
             return (False, 0.0)
-        s = max(0.0, self.S.get(key, 0.0) + (x - (self.mu + self.k)))
+        s = max(0.0, self.leak * self.S.get(key, 0.0) + (x - self.reference))
         self.last_seen[key] = now
         alarmed = s > self.h
         self.S[key] = 0.0 if alarmed else s
@@ -475,8 +487,18 @@ def sniff_thread(args, device, model, masker, calib=None):
     aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async, incident_log=incident_log)
 
     # A.1 CUSUM slow-low detector + A.2 hourly meta-event reporter
-    cusum = CusumTracker(k_sigma=args.cusum_k_sigma, h=args.cusum_h) if args.enable_cusum else None
+    cusum = CusumTracker(k_sigma=args.cusum_k_sigma, h=args.cusum_h,
+                         leak=args.cusum_leak) if args.enable_cusum else None
     last_pair = [None]  # dominant flow of the most recent packet (host-pair)
+
+    def cusum_ref(c):
+        """CUSUM reference = the args.cusum_ref_pct benign percentile of surprise
+        (from calibration quantiles), else None -> fall back to mean+k*sigma."""
+        q = c.get("score_quantiles") if c else None
+        if q and len(q) >= 101:
+            return q[int(max(0, min(100, round(args.cusum_ref_pct))))]
+        return None
+
     meta_log = args.meta_log
     if meta_log is None:
         meta_log = f"meta_events_{args.interface}.csv"
@@ -486,7 +508,7 @@ def sniff_thread(args, device, model, masker, calib=None):
     if calib is not None:
         meta.set_calib(calib)
         if cusum is not None and calib.get("mean") is not None:
-            cusum.set_baseline(calib["mean"], calib.get("std", 1.0))
+            cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
     if cusum is not None:
         logging.info(f"CUSUM slow-low detector ON (k={args.cusum_k_sigma}sigma, h={args.cusum_h} bits); "
                      f"meta-event summary every {args.summary_interval:.0f}s -> {meta_log}")
@@ -517,7 +539,9 @@ def sniff_thread(args, device, model, masker, calib=None):
         current_calib = calib
         meta.set_calib(calib)
         if cusum is not None:
-            cusum.set_baseline(calib["mean"], calib.get("std", 1.0))
+            cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
+            logging.info(f" CUSUM reference = p{args.cusum_ref_pct:g} surprise "
+                         f"({cusum.reference:.2f} bits), leak {args.cusum_leak}, h {args.cusum_h}")
         args.byte_threshold = calib["byte_threshold"]
         is_learning = False
         logging.info("=================================================")
