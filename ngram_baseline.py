@@ -195,6 +195,8 @@ def parse_args():
     p.add_argument("--target_fpr", type=float, default=0.01)
     p.add_argument("--max_train_windows", type=int, default=200000)
     p.add_argument("--max_score_windows", type=int, default=200000)
+    p.add_argument("--max_pcap_size_mb", type=float, default=None,
+                   help="Skip attack pcaps larger than this (match the transformer eval's set)")
     return p.parse_args()
 
 
@@ -207,8 +209,16 @@ def main():
     print("Scoring benign calibration ...")
     benign_cal = score_file(m, args.benign_calibration_pcap, args.topk_frac, args.seq_len, args.max_score_windows)
 
+    # Attack calibration files = every pcap in attack_dir EXCEPT the benign and
+    # held-out files (which often live in the same directory).
+    exclude = {os.path.abspath(p) for p in
+               (args.benign_calibration_pcap, args.benign_holdout_pcap, args.holdout_attack_pcap)}
+    attack_files = [f for f in sorted(glob.glob(os.path.join(args.attack_dir, "*.pcap")))
+                    if os.path.abspath(f) not in exclude
+                    and (args.max_pcap_size_mb is None
+                         or os.path.getsize(f) / 1e6 <= args.max_pcap_size_mb)]
     attack_cal = []
-    for f in sorted(glob.glob(os.path.join(args.attack_dir, "*.pcap"))):
+    for f in attack_files:
         s = score_file(m, f, args.topk_frac, args.seq_len, args.max_score_windows)
         attack_cal += s
         print(f"  {os.path.basename(f)}: {len(s)} windows")
