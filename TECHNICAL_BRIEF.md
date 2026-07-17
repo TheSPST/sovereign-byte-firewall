@@ -32,9 +32,12 @@ All numbers from held-out evaluation on CIC-IDS2017 (trained on benign Monday tr
 | Held-out zero-day window detection (single-checkpoint byte model, strictest test) | 32.6% of attack windows @ **0.23% FPR** |
 | Companion rate detector (volumetric attacks) | AUC 0.908 |
 | Live deployment (real 2026 traffic, MacBook, self-calibrated) | *[measurement in progress — N incidents/day over M days]* |
-| Second-dataset validation (UNSW-NB15) | *[in progress]* |
+| **Cross-dataset transfer (UNSW-NB15, trained on CIC benign only)** | **calibration AUC 0.752** — statistically identical to 0.726 on CIC's own held-out |
+| Held-out Shellcode on UNSW (byte-only, hardest single-class test) | 8.5% detection @ 1.4% FPR |
 
 **Read the table honestly.** Campaign-level detection is the operational metric: an attack that generates thousands of windows needs only a fraction flagged to be caught, which is how 32.6% window-level detection yields 5/5 campaigns. We publish the window-level number anyway because vendors who only quote campaign metrics are hiding something.
+
+**On the cross-dataset result.** The point isn't the 8.5% single-class number — it's the AUC. A model trained *only* on CIC-IDS2017 benign traffic separates benign from attack on UNSW-NB15 (a different lab, year, and attack toolkit) as well as it does on CIC itself. That is direct evidence it learned general benign-protocol structure rather than memorizing one capture — the property that matters for detecting novel attacks in *your* environment. Held-out Shellcode (8.5% @ 1.4% FPR, byte-only) is a deliberately hard floor: a tiny, evasive, payload-centric class the model never calibrated on, scored without the rate-detector fusion or campaign aggregation used in deployment.
 
 ## What it does not do
 
