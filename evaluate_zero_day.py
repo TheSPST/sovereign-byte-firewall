@@ -64,6 +64,8 @@ from src.dataloader import get_pcap_dataloader
 def parse_args():
     parser = argparse.ArgumentParser(description="Zero-day proof-of-work evaluation harness")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/latest_patcher.pt")
+    parser.add_argument("--backbone", type=str, default=None, choices=[None, "transformer", "mamba"],
+                        help="Override the model backbone (default: read from checkpoint, else transformer)")
     parser.add_argument("--benign_calibration_pcap", type=str, default="scratch/archive_upload/normal.pcap",
                          help="Benign traffic used to fit the threshold (label=0)")
     parser.add_argument("--benign_holdout_pcap", type=str, default="scratch/archive_upload/normal2.pcap",
@@ -116,7 +118,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model(checkpoint_path, device, override_seq_len=None):
+def load_model(checkpoint_path, device, override_seq_len=None, backbone=None):
     if not os.path.exists(checkpoint_path):
         print(f"ERROR: Checkpoint not found at '{checkpoint_path}'", file=sys.stderr)
         sys.exit(1)
@@ -128,15 +130,27 @@ def load_model(checkpoint_path, device, override_seq_len=None):
     if has_prefix:
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
-    pos_weight = state_dict.get("pos_embedding.weight")
-    checkpoint_max_seq_len = pos_weight.shape[0] if pos_weight is not None else 8192
+    # Backbone: explicit arg > value stored in the checkpoint > transformer default.
+    backbone = backbone or checkpoint.get("backbone", "transformer")
 
-    # IMPORTANT: the model architecture (and its pos_embedding table) must always be
-    # built at the checkpoint's native size, or load_state_dict will fail on a shape
-    # mismatch. A shorter --max_sequence_length only limits how long a window we feed
-    # through the model during *scoring* (see main()) — the model just uses the first
-    # N rows of the same embedding table, which is always valid since N <= native size.
-    model = NetworkBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
+    if backbone == "mamba":
+        # Mamba has no positional embedding; take config from the checkpoint (saved
+        # by train_ab.py), falling back to the eval's override / defaults.
+        from src.model_mamba import MambaBytePatcher
+        checkpoint_max_seq_len = checkpoint.get("max_sequence_length", override_seq_len or 512)
+        model = MambaBytePatcher(
+            d_model=checkpoint.get("d_model", 128),
+            num_layers=checkpoint.get("num_layers", 2),
+            max_sequence_length=checkpoint_max_seq_len,
+        ).to(device)
+    else:
+        pos_weight = state_dict.get("pos_embedding.weight")
+        checkpoint_max_seq_len = pos_weight.shape[0] if pos_weight is not None else 8192
+        # IMPORTANT: build at the checkpoint's native size or load_state_dict fails on
+        # a shape mismatch. A shorter --max_sequence_length only limits the scoring
+        # window (see main()) — the model uses the first N rows of the embedding table.
+        model = NetworkBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
+
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -369,7 +383,7 @@ def main():
         agg_label = f"|{agg_label} - benign mean|"
     print(f"Score aggregation: {agg_label}")
 
-    model, max_seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
+    model, max_seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length, backbone=args.backbone)
 
     exclude = {
         os.path.basename(args.benign_calibration_pcap),

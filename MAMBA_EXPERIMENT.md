@@ -64,6 +64,27 @@ Learning check: both converge (loss ~5.6 -> ~0.008), so the Mamba impl trains
 end-to-end. **Verdict so far: Mamba is faster (speedup grows with seq len),
 smaller, and trains.** The remaining gate is ACCURACY (below).
 
+## Next-session runbook — the accuracy A/B (wiring done, UNTESTED until smoke test)
+Wiring added on this branch: `evaluate_zero_day.py --backbone {transformer,mamba}`
+and a self-contained `train_ab.py` that trains either backbone the same way and
+saves an eval-compatible checkpoint. **These were written without a local torch
+to test against — run the smoke test FIRST.**
+
+1. **Smoke test (~2 min, proves wiring end-to-end before spending hours):**
+   ```
+   pip install "causal-conv1d>=1.2.0" mamba-ssm --no-build-isolation
+   python train_ab.py --backbone mamba --train_pcap <any.pcap> --steps 20 --seq_len 128 --out /tmp/smoke.pt
+   python evaluate_zero_day.py --backbone mamba --checkpoint_path /tmp/smoke.pt \
+     --benign_calibration_pcap <a> --benign_holdout_pcap <b> \
+     --attack_dir <d> --holdout_attack_pcap <c> --score_agg topk --topk_frac 0.1
+   ```
+   If both run without error, the wiring is good.
+2. **Real A/B — train both to the SAME steps on the SAME corpus, then eval both
+   on the SAME held-out split** (commands in `train_ab.py` header). Compare
+   calibration AUC + held-out detection @ ~1% FPR to the transformer.
+3. Fair-capacity option: raise `--d_model`/`--num_layers` on the Mamba side to
+   match ~725k params, or report accuracy-per-param.
+
 ## Decision rule (write the verdict when done)
 - Mamba matches transformer accuracy (AUC within ~1–2 pts, held-out FPR
   comparable) at **materially better throughput** → adopt for v2; it strengthens
