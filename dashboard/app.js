@@ -21,6 +21,58 @@ function formatTime(timestamp) {
     return d.toISOString().split('T')[1].slice(0, -1);
 }
 
+// --- Byte surprise heatmap ("what the model saw") ---
+const heatmapCanvas = document.getElementById('heatmap-canvas');
+const heatmapCaption = document.getElementById('heatmap-caption');
+const heatmapTooltip = document.getElementById('heatmap-tooltip');
+const HM_COLS = 32;
+let lastHeatmap = null;  // {bytes, surprise}
+
+function renderHeatmap(hm) {
+    if (!heatmapCanvas || !hm || !hm.surprise || !hm.surprise.length) return;
+    lastHeatmap = hm;
+    const ctx = heatmapCanvas.getContext('2d');
+    const n = hm.surprise.length;
+    const rows = Math.ceil(n / HM_COLS);
+    const cw = heatmapCanvas.width / HM_COLS;
+    const ch = heatmapCanvas.height / rows;
+    // Fixed scale: per-byte surprise ~0..8 bits; >=8 is fully "hot".
+    const HOT = 8.0;
+    ctx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
+    for (let i = 0; i < n; i++) {
+        const r = Math.floor(i / HM_COLS), c = i % HM_COLS;
+        const t = Math.max(0, Math.min(1, hm.surprise[i] / HOT));
+        // cool dark base, red glow rising with surprise
+        const red = Math.round(255 * t);
+        const grn = Math.round(40 + 40 * (1 - t));
+        const blu = Math.round(70 * (1 - t) + 30 * t);
+        ctx.fillStyle = `rgb(${red},${grn},${blu})`;
+        ctx.fillRect(c * cw + 0.5, r * ch + 0.5, cw - 1, ch - 1);
+    }
+    const maxBits = Math.max(...hm.surprise);
+    heatmapCaption.textContent = `${n} bytes · peak ${maxBits.toFixed(2)} bits · red = high surprise`;
+}
+
+if (heatmapCanvas) {
+    heatmapCanvas.addEventListener('mousemove', (ev) => {
+        if (!lastHeatmap) return;
+        const rect = heatmapCanvas.getBoundingClientRect();
+        const scaleX = heatmapCanvas.width / rect.width, scaleY = heatmapCanvas.height / rect.height;
+        const n = lastHeatmap.surprise.length, rows = Math.ceil(n / HM_COLS);
+        const cw = heatmapCanvas.width / HM_COLS, ch = heatmapCanvas.height / rows;
+        const c = Math.floor(((ev.clientX - rect.left) * scaleX) / cw);
+        const r = Math.floor(((ev.clientY - rect.top) * scaleY) / ch);
+        const i = r * HM_COLS + c;
+        if (i < 0 || i >= n) { heatmapTooltip.style.display = 'none'; return; }
+        const b = lastHeatmap.bytes[i];
+        heatmapTooltip.textContent = `#${i}  byte 0x${b.toString(16).padStart(2,'0')} (${b})  ${lastHeatmap.surprise[i].toFixed(2)} bits`;
+        heatmapTooltip.style.left = (ev.clientX + 12) + 'px';
+        heatmapTooltip.style.top = (ev.clientY + 12) + 'px';
+        heatmapTooltip.style.display = 'block';
+    });
+    heatmapCanvas.addEventListener('mouseleave', () => { heatmapTooltip.style.display = 'none'; });
+}
+
 function formatEnrichment(e) {
     if (!e || Object.keys(e).length === 0) return '';
     const parts = [];
@@ -120,6 +172,9 @@ function connect() {
     
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
+        if (data.enrichment && data.enrichment.heatmap) {
+            renderHeatmap(data.enrichment.heatmap);
+        }
         addLog(data.type, data.score, data.message, data.timestamp, data.enrichment);
         updateStats(data.type, data.score);
     };
