@@ -188,6 +188,9 @@ def parse_args():
     p.add_argument("--benign_holdout_pcap", required=True)
     p.add_argument("--attack_dir", required=True)
     p.add_argument("--holdout_attack_pcap", required=True)
+    p.add_argument("--train_pcap", default=None,
+                   help="Benign corpus to train the n-gram on (default: the calibration pcap). "
+                        "Point at the full Monday training file for a same-corpus fair fight vs the transformer.")
     p.add_argument("--order", type=int, default=3, help="n-gram context length (bytes)")
     p.add_argument("--alpha", type=float, default=0.1, help="add-alpha smoothing")
     p.add_argument("--topk_frac", type=float, default=0.1)
@@ -202,8 +205,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    print(f"Building order-{args.order} n-gram from benign calibration ...")
-    m = build_model(args.benign_calibration_pcap, args.order, args.alpha,
+    train_pcap = args.train_pcap or args.benign_calibration_pcap
+    print(f"Building order-{args.order} n-gram from {train_pcap} ...")
+    m = build_model(train_pcap, args.order, args.alpha,
                     args.seq_len, args.max_train_windows)
 
     print("Scoring benign calibration ...")
