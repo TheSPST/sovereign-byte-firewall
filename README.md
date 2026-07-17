@@ -1,114 +1,111 @@
-# Sovereign Byte-Level Anomaly Detection Engine
+# Sovereign Byte-Level Firewall
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![HPC A100 Optimized](https://img.shields.io/badge/HPC-A100%20Optimized-NVIDIA?logo=nvidia&logoColor=white)](https://www.nvidia.com/)
-[![SLURM Scheduler](https://img.shields.io/badge/Scheduler-SLURM-blue)](https://slurm.schedmd.com/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-An encoder-free, sovereign byte-level network anomaly detection engine optimized for high-throughput execution on multi-GPU A100 HPC clusters (e.g., CDAC AI Kosh) and local Apple Silicon environments.
+**A byte-level language model that detects zero-day network attacks — no signatures, no cloud, no log pipeline.**
 
----
+A compact causal transformer (~1.6M parameters) is trained to predict raw network
+traffic byte by byte. Having learned the structural grammar of benign traffic, it
+scores live packets by *surprise* — how improbable each byte is given everything
+before it. Attacks it has never seen produce byte sequences the model finds
+improbable; that is the entire detection signal. Runs fully offline on anything
+from an Apple Silicon laptop to an A100 node.
 
-## 1. Executive Summary
+## Results (honest numbers)
 
-Traditional network intrusion detection architectures introduce severe bottlenecks by translating raw packets into human-readable text logs (SIEM, Syslogs, NetFlow) or utilizing CPU-bound flow extractors (e.g., CICFlowMeter). This process inflates data volume by up to 500% and delays latency critical responses. 
+Zero-day protocol on CIC-IDS2017: trained on **benign Monday traffic only**, all
+attacks unseen. Fused system = byte model OR-fused with a lightweight
+connection-rate detector.
 
-The **Sovereign Byte-Level Anomaly Detection Engine** bypasses text-based translation entirely. It processes raw network traffic (`.pcap` format) as a continuous 1D stream of integers representing raw byte values ($0 \text{ to } 255$). By modeling network bytes as a sequence prediction task (similar to character-level language modeling), the engine natively learns protocol grammar at the packet level. Zero-day payloads, malware heartbeats, and fuzzing attacks are flagged instantly as anomalous structural entropy spikes.
+| Measurement | Result |
+|---|---|
+| Full-day eval, fused (Wed: Hulk, GoldenEye, Slowloris, Slowhttptest, Heartbleed) | **5/5 attack campaigns detected** |
+| False alarms that day | **0.9–1.4/hour** (byte detector alone: 0–0.5/hour) |
+| Held-out zero-day window detection (byte model, strictest metric) | 32.6% @ **0.23% FPR** |
+| Live deployment (real traffic, MacBook, 1h self-calibration) | measurement in progress |
+| Second dataset (UNSW-NB15) | in progress |
 
----
+Window-level detection and campaign-level detection differ because an attack
+campaign generates thousands of windows — flagging a fraction catches the
+campaign. We report both. Known blind spot: slow low-rate brute-force (see
+`TECHNICAL_BRIEF.md` for what this tool is honestly for and not for).
 
-## 2. Core Architecture & Mathematical Optimizations
+## Quickstart — live demo on your own machine
 
-To prevent CPU memory thrashing and GPU starvation when reading massive 12GB+ PCAP captures, the engine implements three core mathematical and memory-safety paradigms:
-
-### A. $O(1)$ Zero-Copy Tensor Striding
-Manual slicing and python loops for sequence generation are eliminated. The dataloader reads the raw packet stream into a flat 1D memory array and creates overlapping sequence windows of size $W = 8192$ with a stride step $S$ using PyTorch's native `torch.as_strided()`. 
-* **Strict Trailing Remainder Math:** To prevent memory out-of-bounds segfaults, the tensor is sliced to exactly:
-  $$\text{Limit} = (\text{num\_windows} \times S) + (W - S)$$
-  where $\text{num\_windows} = \max(0, (N - W) // S + 1)$ for a flat buffer of size $N$.
-* **Storage Detachment:** Yielded sequence tensors are decoupled from the large underlying 10MB chunk buffers using `.clone()`, allowing Python's garbage collector to instantly release memory pointers and prevent Out-Of-Memory (OOM) crashes on GPU nodes.
-
-### B. Vectorized Shannon Entropy Matrix Math
-We replace Python loops and `Counter` statistics with PyTorch's native `torch.bincount()` to bin byte frequency histograms. Probabilities $P(x_i)$ are computed across the batch, and Shannon Entropy is calculated in a single SIMD execution pass:
-$$H_t = - \sum_{i=0}^{255} P(x_i) \log_2 P(x_i)$$
-This Hadamard product and summation executes natively on GPU accelerators, allowing the engine to calculate and write packet-level anomalies (such as `TCP_SYN_Flood` or `Abnormal_Entropy` spikes) to a line-buffered CSV database (`anomaly_labels.csv`) without blocking training throughput.
-
-### C. Native Sub-Quadratic Attention Math
-The `NetworkBytePatcher` model defaults to an ultra-lightweight scale (`num_layers=2`, `d_model=128`, `nhead=4`) to achieve sub-millisecond per-packet inference.
-The self-attention block utilizes PyTorch 2.x's native `torch.nn.functional.scaled_dot_product_attention` with `attn_mask=None` and `is_causal=True`. This bypasses custom attention masking matrix multiplications, triggering optimal FlashAttention kernels and utilizing fast SRAM tiling to avoid $O(N^2)$ memory scaling on long 8192-byte sequences.
-
----
-
-## 3. Repository Structure
-
-```text
-├── src/
-│   ├── __init__.py
-│   ├── dataloader.py      # Strided PCAP dataset, SHA-256 caching, and anomaly labeler
-│   ├── model.py           # Pre-LN causal transformer patcher with FlashAttention
-│   └── training.py        # Telemetry-logged training loop with SLURM pre-emption checkpoints
-├── tests/
-│   ├── test_dataloader.py # Dataloader and cache validation
-│   ├── test_model.py      # Causality, scale, and latency tests
-│   ├── test_training.py   # Resilient load/resume validation
-│   └── test_evaluation.py # Visualizer integration test sandbox
-├── scripts/
-│   ├── download_data.sh   # Initializes directories & downloads public PCAP datasets
-│   └── prepare_artifacts.sh # Packages source files into a lightweight deployment zip
-├── setup_and_verify.py    # Hardware diagnostics & dry-run validation gatekeeper
-├── run_training.py        # Orchestration entrypoint script
-├── evaluate.py            # Headless runner to visualize running entropy profiles
-└── sbatch_train.sh        # SLURM script with pre-emption SIGTERM trap handlers
-```
-
----
-
-## 4. Cluster Deployment & Execution Guide
-
-Follow this step-by-step workflow on your HPC cluster (e.g., CDAC AI Kosh):
-
-### Step 1: Bootstrap the Environment
-Clone the repository and install core dependencies.
 ```bash
-# Clone the repository
-git clone https://github.com/TheSPST/sovereign-byte-firewall.git
-cd sovereign-byte-firewall
+git clone <repo-url> && cd sovereign-byte-firewall
+conda create -n sovereign python=3.11 -y && conda activate sovereign
+pip install torch scapy websockets
 
-# Setup a clean environment (e.g., Conda)
-conda create -n sovereign python=3.11 -y
-conda activate sovereign
-
-# Install PyTorch and tooling
-pip install torch scapy matplotlib
+# 1 hour of silent self-calibration on your network, then live monitoring
+# with a real-time dashboard (opens in your browser):
+./start_dashboard.sh --learning_time 3600
 ```
 
-### Step 2: Prepare Datasets
-Fetch training baselines directly to the cluster's high-speed storage.
+Day one is silent: the engine learns *your* network's baseline and sets its own
+threshold (saved to `calibration_<iface>.json`). Alerts are deduplicated into
+incidents and logged to `incidents_<iface>.csv`. Default checkpoint:
+`ckpt_best/checkpoints/latest_patcher_ep0_gs75000_mid_epoch.pt` (the validated peak).
+
+## Reproduce the evaluation
+
 ```bash
-# Create folders and symlink fallbacks
-bash scripts/download_data.sh
-
-# Download Wednesday working hours PCAP (CIC-IDS2017)
-wget -O data/cic-ids2017/dataset.zip http://205.174.165.80/CICDataset/CIC-IDS2017/Dataset/PCAPs/Wednesday-workingHours.pcap.zip
-unzip data/cic-ids2017/dataset.zip -d data/cic-ids2017/
+python evaluate_zero_day.py \
+  --checkpoint_path ckpt_best/checkpoints/latest_patcher_ep0_gs75000_mid_epoch.pt \
+  --score_agg topk --topk_frac 0.1
 ```
 
-### Step 3: Run Diagnostic Validation
-Run the diagnostic gatekeeper to verify CUDA visibility, VRAM allocations, and model dry-run passes:
-```bash
-python setup_and_verify.py --dataset_path ./data/cic-ids2017/Wednesday-workingHours.pcap
+`--score_agg topk` (mean surprise of the top 10% most surprising bytes per
+window) is the validated recipe; every deployed component mirrors it.
+`scripts/unsw_eval_kaggle.py` runs the same protocol on UNSW-NB15.
+
+## How it works
+
+1. **Bytes in, no translation.** Traffic (live or `.pcap`) is a 1D stream of
+   values 0–255. No flow extraction, no DPI parsing, no log conversion.
+2. **Masking.** Deterministic fields (addresses, checksums) and always-encrypted
+   payloads (TLS app data with cross-packet record tracking, QUIC, WireGuard,
+   SSH transport) are masked so the model learns protocol structure, not
+   ciphertext noise (`src/dataloader.py`).
+3. **Model.** Pre-LN causal transformer (2 layers, d_model=128, nhead=4) with
+   native `scaled_dot_product_attention` (FlashAttention path). Sub-millisecond
+   per-packet inference (`src/model.py`).
+4. **Scoring.** Per-window surprise = mean of top-10% per-byte
+   −log₂ P(byte | context). Threshold set per environment by self-calibration
+   (99.9th percentile of benign baseline).
+5. **Fusion.** OR-fused with a SYN-rate detector: byte model catches payload
+   anomalies, rate detector catches volumetric floods (`fuse_detectors.py`).
+
+## Repository map
+
+```
+src/                    model, strided pcap dataloader + masking, training loop
+firewall_daemon.py      live sniffer -> fused detectors -> WebSocket alerts
+dashboard/              real-time browser dashboard
+evaluate_zero_day.py    the validated zero-day eval harness (topk-surprise)
+evaluate_cic_days*.py   full-day CIC evaluation (single + fused)
+scripts/unsw_eval_kaggle.py  second-dataset validation runner
+tests/                  dataloader, model causality, masking, training tests
+TECHNICAL_BRIEF.md      2-page brief: what it is, honest metrics, pilot offer
+PRODUCT_ROADMAP.md      near-term feature roadmap (pcap-on-alert, heatmap, triage UI)
+FUTURE_ROADMAP.md       pre-filter positioning + open-core strategy
 ```
 
-### Step 4: Submit Training Job
-Submit the training script to the SLURM scheduler.
-```bash
-sbatch sbatch_train.sh
-```
+## Training (HPC / Kaggle)
 
----
+Training runs on CIC-IDS2017 Monday (benign only). Two supported paths:
 
-## 5. Resilient Checkpointing & Telemetry
-During training, the engine maintains:
-- **Resiliency Checkpoints:** Model parameters, optimizer states, epoch markers, and CUDA gradient scalers are saved periodically to `checkpoints/latest_patcher.pt`.
-- **Pre-emption Handling:** `sbatch_train.sh` traps SIGTERM (shutdown warnings) and sends SIGINT to Python to force a final checkpoint save.
-- **Hardware Telemetry logs:** Logs GPU temp, GPU utilization, power draw, and VRAM footprints to `logs/hardware_metrics.json` every 100 steps.
+- **Kaggle GPU:** `kaggle_train.ipynb` / `run_kaggle.py` — auto-resume from
+  HF Hub checkpoints, background eval watcher uploads metrics per checkpoint.
+- **SLURM (e.g. CDAC AI Kosh):** `sbatch sbatch_train.sh` — SIGTERM-trapped
+  pre-emption checkpointing, hardware telemetry to `logs/`.
+  `python setup_and_verify.py --dataset_path <pcap>` gatekeeps the environment.
+
+Checkpoint selection is by **held-out zero-day detection**, not training loss —
+detection peaks early and sharply (see `PROJECT_STATUS_2026-07-12.md`); training
+past the peak overfits. The eval watcher exists precisely to catch the peak.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
