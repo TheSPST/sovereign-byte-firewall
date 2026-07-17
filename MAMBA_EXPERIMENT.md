@@ -51,6 +51,19 @@ Mbps on one A100 (and M2 Pro MPS if relevant) for both backbones at seq_len 512,
 batch 512. This is the "cost at the edge" number the pre-filter positioning
 depends on.
 
+## Throughput A/B result (2026-07-18, Kaggle GPU, torch 2.10+cu128, fused mamba_ssm)
+Forward-pass throughput, d_model=128 / 2 layers / batch 64:
+
+| seq_len | transformer | mamba | speedup |
+|---|---|---|---|
+| 512  | 3,353 win/s | 4,557 win/s | **1.36x** |
+| 2048 | 526 win/s   | 970 win/s   | **1.85x** |
+
+Params: transformer 724,736 vs mamba 299,520 (**0.41x** — 2.4x smaller).
+Learning check: both converge (loss ~5.6 -> ~0.008), so the Mamba impl trains
+end-to-end. **Verdict so far: Mamba is faster (speedup grows with seq len),
+smaller, and trains.** The remaining gate is ACCURACY (below).
+
 ## Decision rule (write the verdict when done)
 - Mamba matches transformer accuracy (AUC within ~1–2 pts, held-out FPR
   comparable) at **materially better throughput** → adopt for v2; it strengthens
