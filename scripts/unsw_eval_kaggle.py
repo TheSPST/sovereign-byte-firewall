@@ -58,7 +58,10 @@ HOLDOUT_CAT = os.environ.get("HOLDOUT_CAT", "Shellcode").strip().lower()
 MAX_PCAPS = int(os.environ.get("MAX_PCAPS", "2"))
 MAX_ATTACK_PKTS = int(os.environ.get("MAX_ATTACK_PKTS", "200000"))
 
-INPUT_ROOT = "/kaggle/input" if os.path.isdir("/kaggle/input") else "."
+# Roots scanned for pcaps + GT CSVs. Override with INPUT_ROOTS (colon-separated).
+# ./unsw_pcaps is included so chunks wget'ed in a notebook cell are picked up.
+_default_roots = [r for r in ("/kaggle/input", "unsw_pcaps") if os.path.isdir(r)] or ["."]
+INPUT_ROOTS = os.environ.get("INPUT_ROOTS", ":".join(_default_roots)).split(":")
 WORK = "unsw_work"
 os.makedirs(WORK, exist_ok=True)
 
@@ -80,7 +83,10 @@ def fail(msg):
 # ---------------------------------------------------------------------------
 def inventory():
     pcaps, gt_csvs, presplit = [], [], []
-    for path in glob.glob(os.path.join(INPUT_ROOT, "**", "*"), recursive=True):
+    paths = []
+    for root in INPUT_ROOTS:
+        paths.extend(glob.glob(os.path.join(root, "**", "*"), recursive=True))
+    for path in paths:
         low = os.path.basename(path).lower()
         if low.endswith((".pcap", ".pcapng", ".cap")):
             # Pre-labelled per-class pcaps (some mirrors ship these)
@@ -94,7 +100,7 @@ def inventory():
     pcaps.sort(); gt_csvs.sort(); presplit.sort()
 
     print("=" * 70)
-    print("INVENTORY of attached data under", INPUT_ROOT)
+    print("INVENTORY of attached data under", ", ".join(INPUT_ROOTS))
     print(f"  raw pcap chunks : {len(pcaps)}")
     for p in pcaps[:10]:
         print(f"     {p} ({os.path.getsize(p)/1e6:.0f} MB)")
