@@ -167,6 +167,41 @@ def load_attack_flows(gt_csvs):
 # ---------------------------------------------------------------------------
 # Step 3: split raw pcap chunks into benign / per-category attack pcaps
 # ---------------------------------------------------------------------------
+def _make_l3_decoder(datalink):
+    """Return a fn(buf) -> dpkt IP/IP6 object or None, matching the pcap's
+    link-layer type. UNSW-NB15 was captured with `tcpdump -i any`, which yields
+    Linux SLL (datalink 113), NOT Ethernet (1) - so Ethernet parsing silently
+    fails on every packet. Handles Ethernet, SLL, SLL2, and raw-IP captures."""
+    import dpkt
+    # dpkt exposes DLT_* on its pcap Reader module in most versions.
+    if datalink == 113 and hasattr(dpkt, "sll"):
+        def dec(buf):
+            try:
+                return dpkt.sll.SLL(buf).data
+            except Exception:
+                return None
+    elif datalink == 276 and hasattr(dpkt, "sll2"):
+        def dec(buf):
+            try:
+                return dpkt.sll2.SLL2(buf).data
+            except Exception:
+                return None
+    elif datalink in (101, 12, 14):  # DLT_RAW variants: buffer starts at IP
+        def dec(buf):
+            try:
+                v = buf[0] >> 4
+                return dpkt.ip.IP(buf) if v == 4 else (dpkt.ip6.IP6(buf) if v == 6 else None)
+            except Exception:
+                return None
+    else:  # Ethernet (1) and fallback
+        def dec(buf):
+            try:
+                return dpkt.ethernet.Ethernet(buf).data
+            except Exception:
+                return None
+    return dec
+
+
 def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
     import dpkt
 
@@ -246,16 +281,28 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
                 rd = open_reader(fh, path)
             except Exception as e:
                 print(f"  SKIP (unreadable: {e})"); continue
+            dl = rd.datalink()
+            decode_l3 = _make_l3_decoder(dl)
+            is_ethernet = (dl == 1)
+            print(f"  datalink={dl} (1=Ethernet, 113=Linux SLL, 276=SLL2, 101=raw)"
+                  + ("" if is_ethernet else " -> normalizing frames to Ethernet for the model"))
             for ts, buf in rd:
                 key = pair = sip = dip = None
+                wbuf = None  # Ethernet-framed bytes to persist (model trained on Ethernet)
                 try:
-                    eth = dpkt.ethernet.Ethernet(buf)
-                    ip = eth.data
+                    ip = decode_l3(buf)
                     if isinstance(ip, dpkt.ip.IP) and isinstance(ip.data, (dpkt.tcp.TCP, dpkt.udp.UDP)):
                         l4 = ip.data
                         sip = socket.inet_ntoa(ip.src); dip = socket.inet_ntoa(ip.dst)
                         key = (sip, l4.sport, dip, l4.dport, ip.p)
                         pair = frozenset((sip, dip))
+                        if is_ethernet:
+                            wbuf = buf  # already Ethernet; keep exact bytes
+                        else:
+                            eth = dpkt.ethernet.Ethernet(
+                                src=b"\x00" * 6, dst=b"\x00" * 6,
+                                type=dpkt.ethernet.ETH_TYPE_IP, data=ip)
+                            wbuf = bytes(eth)
                 except Exception:
                     pass
                 t = int(ts)
@@ -266,7 +313,7 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
                     src_census[sip] += 1
                     if sip in attacker_ips or dip in attacker_ips:
                         attacker_ip_pkts += 1
-                parsed.append((ts, buf, key, pair, sip, dip, t))
+                parsed.append((ts, wbuf, key, pair, sip, dip, t))
 
         # Decide whether to use the time window: only if any 5-tuple/pair key
         # exists AND at least one time-window hit occurs on a sample.
@@ -284,16 +331,19 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
             verdict = "USABLE" if use_time else "NOT usable (clock mismatch) -> time-agnostic 5-tuple/IP-pair matching"
             print(f"  MATCH_MODE=auto: time-window {verdict}")
 
-        for (ts, buf, key, pair, sip, dip, t) in parsed:
+        for (ts, wbuf, key, pair, sip, dip, t) in parsed:
+            if wbuf is None:  # non-IP / unparseable — don't pollute the byte stream
+                stats["skipped_non_ip"] += 1
+                continue
             cat = categorize(key, pair, sip, dip, t, use_time)
             if cat is not None:
                 w = writer(f"attack_{cat}")
                 if w[2] < MAX_ATTACK_PKTS:
-                    w[0].writepkt(buf, ts); w[2] += 1
+                    w[0].writepkt(wbuf, ts); w[2] += 1
                 stats[cat] += 1
             else:
                 w = writer(benign_name)
-                w[0].writepkt(buf, ts); w[2] += 1
+                w[0].writepkt(wbuf, ts); w[2] += 1
                 stats["benign"] += 1
 
     print(f"  pcap time range: {pcap_ts_min}..{pcap_ts_max}")
