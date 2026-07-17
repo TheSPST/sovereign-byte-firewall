@@ -128,6 +128,18 @@ def parse_args():
                         help="Collapse repeated alerts of the same type within this many seconds into one incident (0 = disable)")
     parser.add_argument("--incident_log", type=str, default=None,
                         help="CSV file to append closed incidents to (default: incidents_<interface>.csv; 'none' to disable)")
+    parser.add_argument("--enable_cusum", action="store_true", default=True,
+                        help="Per-flow CUSUM accumulator for slow-and-low/APT detection (default on)")
+    parser.add_argument("--no_cusum", dest="enable_cusum", action="store_false",
+                        help="Disable the CUSUM slow-low detector")
+    parser.add_argument("--cusum_k_sigma", type=float, default=0.5,
+                        help="CUSUM slack allowance in units of benign sigma (default 0.5)")
+    parser.add_argument("--cusum_h", type=float, default=25.0,
+                        help="CUSUM alarm bound in accumulated bits (default 25)")
+    parser.add_argument("--summary_interval", type=float, default=3600.0,
+                        help="Seconds between hourly meta-event summaries (default 3600; set lower for demos)")
+    parser.add_argument("--meta_log", type=str, default=None,
+                        help="CSV for hourly meta-event summaries (default: meta_events_<interface>.csv; 'none' to disable)")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length for byte patcher")
     parser.add_argument("--ws_port", type=int, default=8765, help="WebSocket port for dashboard")
     return parser.parse_args()
@@ -294,6 +306,154 @@ class IncidentAggregator:
                 logging.warning(f"Could not write incident log: {e}")
         self.incidents.pop(key, None)
 
+# ---------------------------------------------------------------------------
+# A.1 CUSUM per-flow accumulator (slow-and-low / APT detection)
+# ---------------------------------------------------------------------------
+class CusumTracker:
+    """Per-flow cumulative-sum change detector. For each host-pair key:
+        S = max(0, S + (x - (mu + k)))          # x = window surprise (bits)
+    alarm when S > h, then reset that flow's S to 0. Catches a persistent
+    host-pair whose windows are each BELOW the per-window alarm threshold but
+    consistently above the benign mean -- the memoryless detector's blind spot.
+    Bounded memory: stale flows evicted by TTL, hard-capped by LRU."""
+
+    MAX_FLOWS = 8192
+
+    def __init__(self, k_sigma=0.5, h=25.0, ttl=172800.0):
+        self.k_sigma = k_sigma
+        self.h = h
+        self.ttl = ttl
+        self.mu = 0.0
+        self.sigma = 1.0
+        self.k = 0.0
+        self.enabled = False
+        self.S = {}
+        self.last_seen = {}
+
+    def set_baseline(self, mu, sigma):
+        self.mu = mu
+        self.sigma = max(1e-6, sigma)
+        self.k = self.k_sigma * self.sigma
+        self.enabled = True
+
+    def update(self, key, x, now):
+        """Feed one window's (flow_key, surprise). Returns (alarmed, level)."""
+        if not self.enabled or key is None:
+            return (False, 0.0)
+        s = max(0.0, self.S.get(key, 0.0) + (x - (self.mu + self.k)))
+        self.last_seen[key] = now
+        alarmed = s > self.h
+        self.S[key] = 0.0 if alarmed else s
+        self._evict(now)
+        return (alarmed, s)
+
+    def _evict(self, now):
+        if len(self.last_seen) <= self.MAX_FLOWS:
+            return
+        cutoff = now - self.ttl
+        for k in [k for k, t in self.last_seen.items() if t < cutoff]:
+            self.last_seen.pop(k, None); self.S.pop(k, None)
+        # still over cap -> drop least-recently-seen
+        while len(self.last_seen) > self.MAX_FLOWS:
+            oldest = min(self.last_seen, key=self.last_seen.get)
+            self.last_seen.pop(oldest, None); self.S.pop(oldest, None)
+
+
+# ---------------------------------------------------------------------------
+# A.2 Hourly meta-event summary + concept-drift surface
+# ---------------------------------------------------------------------------
+class MetaEventReporter:
+    """Rolls incidents over a rolling window (default 1h) into a single
+    meta-event digest, and checks for concept drift by comparing the window's
+    live score distribution to the calibration baseline (PSI). Emits to the
+    dashboard, a meta_events CSV, and the log."""
+
+    def __init__(self, interval, emit_fn, meta_log=None):
+        self.interval = interval
+        self.emit_fn = emit_fn
+        self.meta_log = meta_log
+        self.calib = None
+        self.last_summary = time.time()
+        self.incidents = []
+        self.recent_scores = deque(maxlen=50000)
+        if meta_log and not os.path.exists(meta_log):
+            with open(meta_log, "w") as f:
+                f.write("window_start,window_end,incidents,by_type,top_talkers,top_ports,drift_psi,drift_flag,verdict\n")
+
+    def set_calib(self, calib):
+        self.calib = calib
+
+    def record_incident(self, key, enrichment):
+        self.incidents.append((key, enrichment or {}))
+
+    def record_score(self, x):
+        self.recent_scores.append(x)
+
+    def _psi(self):
+        """Population Stability Index of recent live scores vs the calibration
+        deciles. >0.25 conventionally signals a meaningful distribution shift."""
+        q = self.calib.get("score_quantiles") if self.calib else None
+        if not q or len(q) < 101 or len(self.recent_scores) < 100:
+            return None
+        edges = [q[i] for i in range(0, 101, 10)]  # 10 decile bins
+        obs = [0] * 10
+        for x in self.recent_scores:
+            b = min(9, max(0, bisect.bisect_right(edges, x) - 1))
+            obs[b] += 1
+        n = len(self.recent_scores)
+        psi = 0.0
+        for o_count in obs:
+            o = max(o_count / n, 1e-4)
+            psi += (o - 0.1) * math.log(o / 0.1)
+        return psi
+
+    def maybe_summarize(self, now, force=False):
+        if not force and (now - self.last_summary) < self.interval:
+            return None
+        start, end = self.last_summary, now
+        n = len(self.incidents)
+        by_type = Counter(k for k, _ in self.incidents)
+        talkers, ports = Counter(), Counter()
+        for _, e in self.incidents:
+            for t in e.get("top_talkers", []):
+                talkers[t["pair"]] += t.get("bytes", 0)
+            for p in e.get("top_ports", []):
+                ports[p] += 1
+        psi = self._psi()
+        drift_flag = psi is not None and psi > 0.25
+        if drift_flag:
+            verdict = f"DRIFT: baseline may be stale (PSI {psi:.2f}) - consider recalibrating"
+        elif n == 0:
+            verdict = "quiet hour - no incidents"
+        else:
+            verdict = f"{n} incident(s), " + ", ".join(f"{t}:{c}" for t, c in by_type.items())
+        summary = {
+            "window_start": start, "window_end": end, "incidents": n,
+            "by_type": dict(by_type),
+            "top_talkers": [p for p, _ in talkers.most_common(3)],
+            "top_ports": [p for p, _ in ports.most_common(5)],
+            "drift_psi": round(psi, 3) if psi is not None else None,
+            "drift_flag": drift_flag, "verdict": verdict,
+        }
+        self.emit_fn("META", verdict, None, summary)
+        logging.info(f"[META] {time.strftime('%H:%M', time.localtime(end))} summary: {verdict}")
+        if self.meta_log:
+            try:
+                with open(self.meta_log, "a") as f:
+                    f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(start))},"
+                            f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(end))},"
+                            f"{n},\"{dict(by_type)}\",\"{summary['top_talkers']}\","
+                            f"\"{summary['top_ports']}\",{summary['drift_psi']},"
+                            f"{drift_flag},\"{verdict}\"\n")
+            except OSError as e:
+                logging.warning(f"Could not write meta log: {e}")
+        # reset window
+        self.last_summary = now
+        self.incidents = []
+        self.recent_scores.clear()
+        return summary
+
+
 def sniff_thread(args, device, model, masker, calib=None):
     tls_state = {}
     byte_buffer = bytearray()
@@ -313,6 +473,23 @@ def sniff_thread(args, device, model, masker, calib=None):
     if incident_log:
         logging.info(f"Incident log: {incident_log}")
     aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async, incident_log=incident_log)
+
+    # A.1 CUSUM slow-low detector + A.2 hourly meta-event reporter
+    cusum = CusumTracker(k_sigma=args.cusum_k_sigma, h=args.cusum_h) if args.enable_cusum else None
+    last_pair = [None]  # dominant flow of the most recent packet (host-pair)
+    meta_log = args.meta_log
+    if meta_log is None:
+        meta_log = f"meta_events_{args.interface}.csv"
+    elif meta_log.lower() == "none":
+        meta_log = None
+    meta = MetaEventReporter(args.summary_interval, trigger_alert_async, meta_log=meta_log)
+    if calib is not None:
+        meta.set_calib(calib)
+        if cusum is not None and calib.get("mean") is not None:
+            cusum.set_baseline(calib["mean"], calib.get("std", 1.0))
+    if cusum is not None:
+        logging.info(f"CUSUM slow-low detector ON (k={args.cusum_k_sigma}sigma, h={args.cusum_h} bits); "
+                     f"meta-event summary every {args.summary_interval:.0f}s -> {meta_log}")
 
     # --- CALIBRATION MODE STATE ---
     is_learning = args.learning_time > 0
@@ -338,6 +515,9 @@ def sniff_thread(args, device, model, masker, calib=None):
         calib = save_calibration(args.interface, torch.tensor(learning_scores),
                                  elapsed_seconds=elapsed, target_iph=args.target_incidents_per_hour)
         current_calib = calib
+        meta.set_calib(calib)
+        if cusum is not None:
+            cusum.set_baseline(calib["mean"], calib.get("std", 1.0))
         args.byte_threshold = calib["byte_threshold"]
         is_learning = False
         logging.info("=================================================")
@@ -362,9 +542,13 @@ def sniff_thread(args, device, model, masker, calib=None):
         if t_bucket > current_bucket:
             if not is_learning and syn_count > args.rate_threshold:
                 msg = f"Volumetric anomaly detected! {syn_count} SYNs in 100ms window."
-                if aggregator.report("RATE", msg, score=syn_count, enrichment=compute_enrichment(pkt_meta)):
+                rate_enr = compute_enrichment(pkt_meta)
+                if aggregator.report("RATE", msg, score=syn_count, enrichment=rate_enr):
                     logging.warning(f"[RATE ALARM] {msg}")
+                    meta.record_incident("RATE", rate_enr)
             aggregator.flush()
+            if not is_learning:
+                meta.maybe_summarize(now)  # hourly meta-event + drift check
             syn_count = 0
             current_bucket = t_bucket
 
@@ -386,6 +570,7 @@ def sniff_thread(args, device, model, masker, calib=None):
                 else:
                     proto, dport = "other", 0
                 pkt_meta.append((now, ipl.src, ipl.dst, 0, dport, proto, len(raw_bytes), is_syn))
+                last_pair[0] = frozenset((ipl.src, ipl.dst))  # flow key for CUSUM
                 cutoff = now - META_WINDOW
                 while pkt_meta and pkt_meta[0][0] < cutoff:
                     pkt_meta.popleft()
@@ -426,6 +611,21 @@ def sniff_thread(args, device, model, masker, calib=None):
                     if (time.time() - learning_start) > args.learning_time:
                         finish_calibration()  # transitions to LIVE in-place, no restart needed
                 else:
+                    meta.record_score(window_score)  # for the drift (PSI) check
+
+                    # A.1 CUSUM: accumulate this flow's surprise for slow-low detection
+                    if cusum is not None:
+                        alarmed, level = cusum.update(last_pair[0], window_score, now)
+                        if alarmed:
+                            pair = " <-> ".join(sorted(last_pair[0])) if last_pair[0] else "?"
+                            msg = (f"Slow/low anomaly: cumulative surprise {level:.1f} bits from {pair} "
+                                   f"(persistent sub-threshold activity)")
+                            enr = compute_enrichment(pkt_meta)
+                            enr["cusum_level"] = round(level, 1)
+                            if aggregator.report("SLOW", msg, score=level, enrichment=enr):
+                                logging.warning(f"[SLOW ALARM] {msg}")
+                                meta.record_incident("SLOW", enr)
+
                     if window_score > args.byte_threshold:
                         pct = score_percentile(window_score, current_calib)
                         pct_str = f" ({pct}th pct of baseline)" if pct is not None else ""
@@ -444,6 +644,7 @@ def sniff_thread(args, device, model, masker, calib=None):
                         }
                         if aggregator.report("BYTE", msg, score=window_score, enrichment=enrich):
                             logging.critical(f"[BYTE ALARM] {msg}")
+                            meta.record_incident("BYTE", enrich)
 
     try:
         sniff(iface=args.interface, prn=packet_callback, store=False)
