@@ -192,9 +192,22 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
     stats = defaultdict(int)
     diag = defaultdict(int)  # 5tuple_hit, 5tuple_time_hit, pair_hit, ip_hit
     pcap_ts_min, pcap_ts_max = None, None
+    from collections import Counter
+    src_census = Counter()
+    parseable = 0
+    attacker_ip_pkts = 0
+
+    # For UNSW: a packet whose src OR dst is a known attacker IP is attack.
+    # We still want the category; take it from any flow/pair the IP participates
+    # in (best-effort). Build attacker_ip -> representative category.
+    ip_cat = {}
+    for pair, spans in attack_pairs.items():
+        for ip in pair:
+            if ip in attacker_ips and ip not in ip_cat:
+                ip_cat[ip] = spans[0][2]
 
     def categorize(key, pair, sip, dip, t, use_time):
-        """Return attack category or None."""
+        """Return attack category or None (cascade: 5-tuple -> IP-pair -> attacker-IP)."""
         if key is not None and key in flows:
             diag["5tuple_hit"] += 1
             spans = flows[key]
@@ -205,7 +218,7 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
                         return c
             else:
                 return spans[0][2]
-        if pair in attack_pairs:
+        if pair is not None and pair in attack_pairs:
             diag["pair_hit"] += 1
             spans = attack_pairs[pair]
             if use_time:
@@ -214,6 +227,13 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
                         return c
             else:
                 return spans[0][2]
+        # Loosest tier: either endpoint is a known attacker IP.
+        if sip in attacker_ips:
+            diag["ip_hit"] += 1
+            return ip_cat.get(sip, "unknown")
+        if dip in attacker_ips:
+            diag["ip_hit"] += 1
+            return ip_cat.get(dip, "unknown")
         return None
 
     for ci, path in enumerate(pcaps[:MAX_PCAPS]):
@@ -241,6 +261,11 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
                 t = int(ts)
                 pcap_ts_min = t if pcap_ts_min is None else min(pcap_ts_min, t)
                 pcap_ts_max = t if pcap_ts_max is None else max(pcap_ts_max, t)
+                if sip is not None:
+                    parseable += 1
+                    src_census[sip] += 1
+                    if sip in attacker_ips or dip in attacker_ips:
+                        attacker_ip_pkts += 1
                 parsed.append((ts, buf, key, pair, sip, dip, t))
 
         # Decide whether to use the time window: only if any 5-tuple/pair key
@@ -272,6 +297,9 @@ def split_pcaps(pcaps, flows, attack_pairs, attacker_ips):
                 stats["benign"] += 1
 
     print(f"  pcap time range: {pcap_ts_min}..{pcap_ts_max}")
+    print(f"  parseable IP/TCP-UDP packets: {parseable}")
+    print(f"  packets involving a known attacker IP {sorted(attacker_ips)}: {attacker_ip_pkts}")
+    print(f"  top talkers (src IP): {src_census.most_common(10)}")
     print(f"  match diagnostics: {dict(diag)}")
     for name, (w, fh, cnt) in out.items():
         fh.close()
