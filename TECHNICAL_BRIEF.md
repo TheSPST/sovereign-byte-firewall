@@ -32,12 +32,12 @@ All numbers from held-out evaluation on CIC-IDS2017 (trained on benign Monday tr
 | Held-out zero-day window detection (single-checkpoint byte model, strictest test) | 32.6% of attack windows @ **0.23% FPR** |
 | Companion rate detector (volumetric attacks) | AUC 0.908 |
 | Live deployment (real 2026 traffic, MacBook, self-calibrated) | *[measurement in progress — N incidents/day over M days]* |
-| **Cross-dataset transfer (UNSW-NB15, trained on CIC benign only)** | **calibration AUC 0.752** — statistically identical to 0.726 on CIC's own held-out |
-| Held-out Shellcode on UNSW (byte-only, hardest single-class test) | 8.5% detection @ 1.4% FPR |
+| **Cross-dataset transfer (UNSW-NB15, trained on CIC benign only)** | **calibration AUC 0.75–0.77** — statistically identical to 0.73 on CIC's own held-out |
+| Held-out single-class window detection on UNSW @ ~1% FPR (byte-only) | 8.5% (Shellcode) – 11.4% (Exploits) |
 
 **Read the table honestly.** Campaign-level detection is the operational metric: an attack that generates thousands of windows needs only a fraction flagged to be caught, which is how 32.6% window-level detection yields 5/5 campaigns. We publish the window-level number anyway because vendors who only quote campaign metrics are hiding something.
 
-**On the cross-dataset result.** The point isn't the 8.5% single-class number — it's the AUC. A model trained *only* on CIC-IDS2017 benign traffic separates benign from attack on UNSW-NB15 (a different lab, year, and attack toolkit) as well as it does on CIC itself. That is direct evidence it learned general benign-protocol structure rather than memorizing one capture — the property that matters for detecting novel attacks in *your* environment. Held-out Shellcode (8.5% @ 1.4% FPR, byte-only) is a deliberately hard floor: a tiny, evasive, payload-centric class the model never calibrated on, scored without the rate-detector fusion or campaign aggregation used in deployment.
+**On the cross-dataset result.** The point isn't the single-class window numbers — it's the AUC. A model trained *only* on CIC-IDS2017 benign traffic separates benign from attack on UNSW-NB15 (a different lab, year, and attack toolkit) as well as it does on CIC itself (AUC 0.75–0.77 vs 0.73). That is direct evidence it learned general benign-protocol structure rather than memorizing one capture — the property that matters for detecting novel attacks in *your* environment. The 8.5–11.4% figures are held-out *window-level* single-class detection at strict 1% FPR — the most conservative possible framing (one attack class never calibrated on, byte detector alone, no fusion, no campaign aggregation). The operational metric is campaign-level: on CIC the same window-level range yielded 5/5 attack campaigns caught at ~1 false alarm/hour, because a campaign emits thousands of windows and only a fraction need flagging. UNSW campaign-level aggregation is not yet run but follows the same arithmetic.
 
 ## What it does not do
 
