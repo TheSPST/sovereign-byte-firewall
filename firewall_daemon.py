@@ -12,16 +12,18 @@ import os
 import sys
 import math
 import time
+import bisect
 import argparse
 import logging
 import json
 import threading
 import asyncio
 import websockets
+from collections import deque, Counter
 
 import torch
 import torch.nn.functional as F
-from scapy.all import sniff, TCP, IP
+from scapy.all import sniff, TCP, IP, UDP
 
 from src.model import NetworkBytePatcher
 from src.dataloader import RawPcapIterableDataset
@@ -45,15 +47,59 @@ async def broadcast_alert(alert_data):
         message = json.dumps(alert_data)
         websockets.broadcast(CONNECTED_CLIENTS, message)
 
-def trigger_alert_async(alert_type, message, score=None):
+def trigger_alert_async(alert_type, message, score=None, enrichment=None):
     if loop is not None:
         alert_data = {
             "timestamp": time.time(),
             "type": alert_type,
             "message": message,
-            "score": score
+            "score": score,
+            "enrichment": enrichment or {},
         }
         asyncio.run_coroutine_threadsafe(broadcast_alert(alert_data), loop)
+
+
+# ---------------------------------------------------------------------------
+# Incident enrichment (deterministic facts, no LLM)
+# ---------------------------------------------------------------------------
+
+def compute_enrichment(pkt_meta):
+    """Summarize the recent packet-metadata ring buffer into human-readable
+    facts an analyst can triage from: top talkers, ports, protocol mix, SYNs.
+    pkt_meta entries: (ts, src, dst, sport, dport, proto, size, is_syn)."""
+    if not pkt_meta:
+        return {}
+    talkers, ports, protos = Counter(), Counter(), Counter()
+    total_bytes = syns = 0
+    for (_ts, src, dst, _sp, dport, proto, size, is_syn) in pkt_meta:
+        talkers[f"{src} -> {dst}"] += size
+        if dport:
+            ports[dport] += 1
+        protos[proto] += 1
+        total_bytes += size
+        if is_syn:
+            syns += 1
+    n = len(pkt_meta)
+    return {
+        "packets": n,
+        "bytes": total_bytes,
+        "top_talkers": [{"pair": k, "bytes": v} for k, v in talkers.most_common(3)],
+        "top_ports": [p for p, _ in ports.most_common(5)],
+        "proto_mix_pct": {p: round(100.0 * c / n) for p, c in protos.most_common()},
+        "syns": syns,
+    }
+
+
+def score_percentile(score, calib):
+    """Map a live surprise score to its percentile in the benign calibration
+    distribution, using the stored quantile array. Returns None if unavailable."""
+    if not calib:
+        return None
+    q = calib.get("score_quantiles")
+    if not q:
+        return None
+    # q[i] is the i-th percentile value (i in 0..100); locate the score.
+    return min(100, max(0, bisect.bisect_left(q, score)))
 
 # Scoring is aligned with evaluate_zero_day.py --score_agg topk --topk_frac 0.1
 # (the validated recipe). Score = mean of the top 10% per-byte surprise
@@ -145,11 +191,19 @@ def save_calibration(interface, scores_tensor, elapsed_seconds=0.0, target_iph=0
         threshold = max(quantile_thr, sigma_thr)
         method = "max(q99.9, mean+3sigma)"
 
+    # 0..100th percentile values, for mapping a live score to its percentile.
+    try:
+        qs = torch.tensor([i / 100.0 for i in range(101)])
+        score_quantiles = torch.quantile(scores_tensor, qs).tolist()
+    except Exception:
+        score_quantiles = None
+
     calib = {
         "interface": interface,
         "score_metric": SCORE_METRIC,
         "byte_threshold": threshold,
         "threshold_method": method,
+        "score_quantiles": score_quantiles,
         "target_incidents_per_hour": target_iph,
         "window_rate_per_sec": round(window_rate, 3),
         "budget_quantile": budget_q,
@@ -186,12 +240,14 @@ class IncidentAggregator:
         self.incident_log = incident_log
         if incident_log and not os.path.exists(incident_log):
             with open(incident_log, "w") as f:
-                f.write("opened_at,closed_at,type,raw_alerts,peak_score\n")
+                f.write("opened_at,closed_at,type,raw_alerts,peak_score,context\n")
 
-    def report(self, key, message, score=None):
-        """Returns True if the alert was emitted, False if suppressed."""
+    def report(self, key, message, score=None, enrichment=None):
+        """Returns True if the alert was emitted, False if suppressed.
+        Enrichment (computed facts) is captured on incident open and carried
+        through to the WS payload and the incident-log context column."""
         if self.window <= 0:
-            self.alert_fn(key, message, score)
+            self.alert_fn(key, message, score, enrichment)
             return True
         now = time.time()
         inc = self.incidents.get(key)
@@ -200,8 +256,9 @@ class IncidentAggregator:
             inc = None
         if inc is None:
             self.incidents[key] = {"first_ts": now, "last_ts": now, "count": 1,
-                                   "max_score": score if score is not None else 0.0}
-            self.alert_fn(key, message, score)
+                                   "max_score": score if score is not None else 0.0,
+                                   "enrichment": enrichment or {}}
+            self.alert_fn(key, message, score, enrichment)
             return True
         inc["count"] += 1
         inc["last_ts"] = now
@@ -222,22 +279,29 @@ class IncidentAggregator:
             msg = (f"Incident closed: {inc['count']} {key} alerts over {duration:.0f}s "
                    f"(peak score {inc['max_score']:.2f})")
             logging.warning(f"[{key} INCIDENT] {msg}")
-            self.alert_fn(key, msg, inc["max_score"])
+            self.alert_fn(key, msg, inc["max_score"], inc.get("enrichment"))
         if self.incident_log:
             try:
+                # context = compact JSON of the opening enrichment (CSV-safe: quoted)
+                ctx = json.dumps(inc.get("enrichment") or {}, separators=(",", ":")).replace('"', "'")
                 with open(self.incident_log, "a") as f:
                     f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(inc['first_ts']))},"
                             f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(inc['last_ts']))},"
-                            f"{key},{inc['count']},{inc['max_score']:.2f}\n")
+                            f"{key},{inc['count']},{inc['max_score']:.2f},\"{ctx}\"\n")
             except OSError as e:
                 logging.warning(f"Could not write incident log: {e}")
         self.incidents.pop(key, None)
 
-def sniff_thread(args, device, model, masker):
+def sniff_thread(args, device, model, masker, calib=None):
     tls_state = {}
     byte_buffer = bytearray()
     current_bucket = int(time.time() * 10)
     syn_count = 0
+    current_calib = calib  # updated in-place when calibration finishes
+
+    # Rolling packet-metadata ring buffer (~last 10s) for incident enrichment.
+    META_WINDOW = 10.0
+    pkt_meta = deque()
 
     incident_log = args.incident_log
     if incident_log is None:
@@ -267,9 +331,11 @@ def sniff_thread(args, device, model, masker):
             logging.error(f"Only {len(learning_scores)} windows seen during calibration - not enough. "
                           "Staying in calibration mode; generate more traffic.")
             return
+        nonlocal current_calib
         elapsed = time.time() - learning_start
         calib = save_calibration(args.interface, torch.tensor(learning_scores),
                                  elapsed_seconds=elapsed, target_iph=args.target_incidents_per_hour)
+        current_calib = calib
         args.byte_threshold = calib["byte_threshold"]
         is_learning = False
         logging.info("=================================================")
@@ -286,25 +352,45 @@ def sniff_thread(args, device, model, masker):
     def packet_callback(packet):
         nonlocal byte_buffer, current_bucket, syn_count, tls_state
 
+        now = time.time()
+        is_syn = bool(TCP in packet and packet[TCP].flags & 0x02)
+
         # 1. Rate Detector (SYN Flood Check)
-        t_bucket = int(time.time() * 10)
+        t_bucket = int(now * 10)
         if t_bucket > current_bucket:
             if not is_learning and syn_count > args.rate_threshold:
                 msg = f"Volumetric anomaly detected! {syn_count} SYNs in 100ms window."
-                if aggregator.report("RATE", msg, score=syn_count):
+                if aggregator.report("RATE", msg, score=syn_count, enrichment=compute_enrichment(pkt_meta)):
                     logging.warning(f"[RATE ALARM] {msg}")
             aggregator.flush()
             syn_count = 0
             current_bucket = t_bucket
-            
-        if TCP in packet and packet[TCP].flags & 0x02: # SYN flag
+
+        if is_syn:
             syn_count += 1
-            
-        # 2. Byte-level Payload Detector
+
         raw_bytes = bytes(packet)
         if not raw_bytes:
             return
-            
+
+        # Capture packet metadata for incident enrichment (cheap, best-effort).
+        try:
+            if IP in packet:
+                ipl = packet[IP]
+                if TCP in packet:
+                    proto, dport = "TCP", packet[TCP].dport
+                elif UDP in packet:
+                    proto, dport = "UDP", packet[UDP].dport
+                else:
+                    proto, dport = "other", 0
+                pkt_meta.append((now, ipl.src, ipl.dst, 0, dport, proto, len(raw_bytes), is_syn))
+                cutoff = now - META_WINDOW
+                while pkt_meta and pkt_meta[0][0] < cutoff:
+                    pkt_meta.popleft()
+        except Exception:
+            pass
+
+        # 2. Byte-level Payload Detector
         # Mask the packet
         masked = masker._mask_packet_addresses(raw_bytes, stream_tls_state=tls_state)
         byte_buffer.extend(masked)
@@ -339,8 +425,14 @@ def sniff_thread(args, device, model, masker):
                         finish_calibration()  # transitions to LIVE in-place, no restart needed
                 else:
                     if window_score > args.byte_threshold:
-                        msg = f"Payload anomaly detected! Surprise: {window_score:.2f} bits > {args.byte_threshold:.2f}"
-                        if aggregator.report("BYTE", msg, score=window_score):
+                        pct = score_percentile(window_score, current_calib)
+                        pct_str = f" ({pct}th pct of baseline)" if pct is not None else ""
+                        msg = (f"Payload anomaly detected! Surprise: {window_score:.2f} bits > "
+                               f"{args.byte_threshold:.2f}{pct_str}")
+                        enrich = compute_enrichment(pkt_meta)
+                        if pct is not None:
+                            enrich["score_percentile"] = pct
+                        if aggregator.report("BYTE", msg, score=window_score, enrichment=enrich):
                             logging.critical(f"[BYTE ALARM] {msg}")
 
     try:
@@ -358,14 +450,17 @@ async def main_async():
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     logging.info(f"Hardware Acceleration: {device}")
 
+    # Load saved calibration (used for the threshold if not overridden, and for
+    # score-percentile enrichment regardless).
+    loaded_calib = load_calibration(args.interface)
+
     # Threshold resolution: explicit CLI flag > saved per-interface calibration > built-in default
     if args.byte_threshold is None:
-        calib = load_calibration(args.interface)
-        if calib is not None:
-            args.byte_threshold = calib["byte_threshold"]
+        if loaded_calib is not None:
+            args.byte_threshold = loaded_calib["byte_threshold"]
             logging.info(f"Loaded saved calibration for '{args.interface}' "
-                         f"(threshold={args.byte_threshold:.2f}, calibrated {calib.get('calibrated_at', '?')}, "
-                         f"{calib.get('num_windows', '?')} windows)")
+                         f"(threshold={args.byte_threshold:.2f}, calibrated {loaded_calib.get('calibrated_at', '?')}, "
+                         f"{loaded_calib.get('num_windows', '?')} windows)")
         else:
             args.byte_threshold = DEFAULT_BYTE_THRESHOLD
             if args.learning_time == 0:
@@ -390,7 +485,7 @@ async def main_async():
     masker = RawPcapIterableDataset("dummy.pcap", mask_addresses=True)
     
     # Run the blocking sniffer in a background thread so asyncio can handle WebSockets
-    sniffer_thread = threading.Thread(target=sniff_thread, args=(args, device, model, masker), daemon=True)
+    sniffer_thread = threading.Thread(target=sniff_thread, args=(args, device, model, masker, loaded_calib), daemon=True)
     sniffer_thread.start()
     
     logging.info(f"Started WebSocket Broadcast Server on ws://localhost:{args.ws_port}")

@@ -21,33 +21,58 @@ function formatTime(timestamp) {
     return d.toISOString().split('T')[1].slice(0, -1);
 }
 
-function addLog(type, score, message, timestamp) {
+function formatEnrichment(e) {
+    if (!e || Object.keys(e).length === 0) return '';
+    const parts = [];
+    if (e.top_talkers && e.top_talkers.length) {
+        parts.push('talkers: ' + e.top_talkers.map(t => t.pair).join(', '));
+    }
+    if (e.top_ports && e.top_ports.length) parts.push('ports: ' + e.top_ports.join('/'));
+    if (e.proto_mix_pct) {
+        parts.push(Object.entries(e.proto_mix_pct).map(([p, v]) => `${p} ${v}%`).join(' '));
+    }
+    if (typeof e.syns === 'number' && e.syns > 0) parts.push(e.syns + ' SYN');
+    if (typeof e.score_percentile === 'number') parts.push(e.score_percentile + 'th pct');
+    return parts.join('  •  ');
+}
+
+function addLog(type, score, message, timestamp, enrichment) {
     const entry = document.createElement('div');
     entry.className = `log-entry ${type.toLowerCase()}-alert`;
-    
+
     const timeSpan = document.createElement('span');
     timeSpan.className = 'time';
     timeSpan.textContent = formatTime(timestamp);
-    
+
     const typeSpan = document.createElement('span');
     typeSpan.className = 'type';
     typeSpan.textContent = type;
-    
+
     const scoreSpan = document.createElement('span');
     scoreSpan.className = 'score';
-    scoreSpan.textContent = type === 'BYTE' ? parseFloat(score).toFixed(2) : score;
-    
+    scoreSpan.textContent = type === 'BYTE' ? parseFloat(score).toFixed(2) : (score ?? '');
+
     const msgSpan = document.createElement('span');
     msgSpan.className = 'msg';
     msgSpan.textContent = message;
-    
+
+    // Enrichment line (computed facts) shown under the message when present.
+    const ctx = formatEnrichment(enrichment);
+    if (ctx) {
+        const ctxSpan = document.createElement('span');
+        ctxSpan.className = 'context';
+        ctxSpan.textContent = ctx;
+        ctxSpan.style.cssText = 'display:block;color:var(--text-secondary);font-family:var(--font-mono);font-size:0.8em;margin-top:4px;';
+        msgSpan.appendChild(ctxSpan);
+    }
+
     entry.appendChild(timeSpan);
     entry.appendChild(typeSpan);
     entry.appendChild(scoreSpan);
     entry.appendChild(msgSpan);
-    
+
     logsContainer.prepend(entry);
-    
+
     // Keep max 100 logs in DOM
     if (logsContainer.children.length > 100) {
         logsContainer.removeChild(logsContainer.lastChild);
@@ -95,7 +120,7 @@ function connect() {
     
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        addLog(data.type, data.score, data.message, data.timestamp);
+        addLog(data.type, data.score, data.message, data.timestamp, data.enrichment);
         updateStats(data.type, data.score);
     };
     
