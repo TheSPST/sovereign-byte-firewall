@@ -160,16 +160,21 @@ sequence is caught by the accumulator while the per-window scorer stays silent.
 **Note:** also validate the plain-surprise CUSUM variant on the held-out eval
 (the one untested scoring idea from memory).
 
-### H.2 Drift monitoring + poisoning-safe baseline update — *~3 days* — answers concept drift
-Builds on the shipped alert-budget calibration. (a) Track live score distribution
-vs. the calibration baseline (PSI/KL); auto-flag when the baseline is stale.
-(b) "Mark false positive" on the dashboard → fold confirmed-benign windows into
-a baseline buffer and *re-derive the threshold* (never a full weight retrain).
-(c) Keep a **frozen reference model** + bound the update rate so a slow-poisoning
-attacker can't shift "normal" to accept malice.
-**Acceptance:** a simulated environment change (score mean shifts +2 bits) raises
-a "baseline stale" flag rather than a false-alarm storm; a slow-poison sequence
-is rejected by the frozen-reference divergence check.
+### H.2 Drift monitoring + poisoning-safe baseline update — **SHIPPED (2026-07-18)** — answers concept drift
+Motivated by a live run: a quiet-2am calibration flooded through a busy morning
+(PSI 3–4.4/hr; threshold and CUSUM ref both stale). Detection alone (the meta
+drift flag) wasn't enough — the system needed to *respond*.
+**Implemented (`AdaptiveRecalibrator` in firewall_daemon.py):** every
+`--recalib_interval` (default 15 min) the byte threshold and CUSUM reference are
+re-fit on the recent live-score buffer at the same alert-budget / p99 quantiles,
+with two poisoning guards: **bounded step** (≤ `--recalib_max_step`, default 1
+bit/update) and a **frozen anchor cap** (≤ `--recalib_cap`, default 3 bits from
+the original calibration) so a slow-poisoning attacker can't drag the threshold
+up without limit. Persists the adapted threshold (anchor preserved) so restarts
+keep it. Unit-tested: drift-up raises the threshold bounded per step, converges
+capped at anchor+cap, poisoning is capped, persistence keeps the anchor.
+*Still open (nice-to-have):* an explicit dashboard "mark false positive" button
+to fold confirmed-benign windows in on demand.
 
 ### H.3 Envelope/metadata upweighting — *~2 days* — sharpens the one signal we keep inside encryption
 Explicitly weight packet timing intervals, sizes, and connection-sequence
