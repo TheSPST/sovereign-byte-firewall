@@ -146,6 +146,19 @@ def parse_args():
                         help="CUSUM alarm bound in accumulated bits (default 25)")
     parser.add_argument("--summary_interval", type=float, default=3600.0,
                         help="Seconds between hourly meta-event summaries (default 3600; set lower for demos)")
+    parser.add_argument("--adaptive_recalib", action="store_true", default=True,
+                        help="Re-fit the threshold + CUSUM reference on recent traffic under drift (default on)")
+    parser.add_argument("--no_adaptive_recalib", dest="adaptive_recalib", action="store_false",
+                        help="Disable adaptive recalibration (static threshold)")
+    parser.add_argument("--recalib_interval", type=float, default=900.0,
+                        help="Seconds between adaptive recalibrations (default 900 = 15 min)")
+    parser.add_argument("--recalib_max_step", type=float, default=1.0,
+                        help="Max bits the threshold may move per recalibration (default 1.0)")
+    parser.add_argument("--recalib_cap", type=float, default=3.0,
+                        help="Max bits the adaptive threshold may drift from the original calibration "
+                             "(poisoning guard: bounds how far a slow attacker can push it, default 3.0)")
+    parser.add_argument("--recalib_min_samples", type=int, default=5000,
+                        help="Minimum recent windows before an adaptive recalibration fires (default 5000)")
     parser.add_argument("--meta_log", type=str, default=None,
                         help="CSV for hourly meta-event summaries (default: meta_events_<interface>.csv; 'none' to disable)")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length for byte patcher")
@@ -222,6 +235,7 @@ def save_calibration(interface, scores_tensor, elapsed_seconds=0.0, target_iph=0
         "interface": interface,
         "score_metric": SCORE_METRIC,
         "byte_threshold": threshold,
+        "anchor_threshold": threshold,  # frozen anchor for adaptive recalibration
         "threshold_method": method,
         "score_quantiles": score_quantiles,
         "target_incidents_per_hour": target_iph,
@@ -466,6 +480,72 @@ class MetaEventReporter:
         return summary
 
 
+# ---------------------------------------------------------------------------
+# H.2 Adaptive recalibration (drift response, poisoning-safe)
+# ---------------------------------------------------------------------------
+def persist_adapted_threshold(interface, new_threshold, new_ref):
+    """Rewrite the live byte_threshold in the calibration file so a restart keeps
+    the adapted value. anchor_threshold is left untouched (the frozen anchor)."""
+    path = calibration_path(interface)
+    try:
+        with open(path) as f:
+            calib = json.load(f)
+        calib["byte_threshold"] = round(new_threshold, 4)
+        calib["adapted_ref"] = round(new_ref, 4)
+        calib["adapted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(path, "w") as f:
+            json.dump(calib, f, indent=2)
+    except (OSError, json.JSONDecodeError) as e:
+        logging.warning(f"Could not persist adapted threshold: {e}")
+
+
+class AdaptiveRecalibrator:
+    """Re-fits the byte threshold and the CUSUM reference on RECENT live scores so
+    the alert budget keeps holding under concept drift (e.g. quiet-night baseline
+    vs busy-day traffic). Guardrails against poisoning / over-reaction:
+      - bounded step: threshold moves at most +/- max_step bits per update;
+      - frozen anchor: it can never move more than +/- cap bits from the ORIGINAL
+        calibration, so a slow attacker who drags traffic up cannot blind the
+        detector without limit.
+    Threshold re-fit uses the SAME alert-budget quantile as the original."""
+
+    def __init__(self, budget_q, ref_pct, anchor_threshold, anchor_ref,
+                 interval=900.0, max_step=1.0, cap=3.0, min_samples=5000, enabled=True):
+        self.budget_q = budget_q
+        self.ref_pct = ref_pct
+        self.anchor_threshold = anchor_threshold
+        self.anchor_ref = anchor_ref
+        self.cur_threshold = anchor_threshold
+        self.cur_ref = anchor_ref
+        self.interval = interval
+        self.max_step = max_step
+        self.cap = cap
+        self.min_samples = min_samples
+        self.enabled = enabled and (budget_q is not None) and (anchor_threshold is not None)
+        self.last = time.time()
+
+    @staticmethod
+    def _quantile(sorted_vals, q):
+        i = min(len(sorted_vals) - 1, max(0, int(round(q * (len(sorted_vals) - 1)))))
+        return sorted_vals[i]
+
+    def _bounded(self, cand, cur, anchor):
+        cand = min(cur + self.max_step, max(cur - self.max_step, cand))      # per-update step
+        cand = min(anchor + self.cap, max(anchor - self.cap, cand))          # frozen-anchor cap
+        return cand
+
+    def maybe(self, scores, now):
+        """Returns (new_threshold, new_ref) if it recalibrated, else None."""
+        if not self.enabled or (now - self.last) < self.interval or len(scores) < self.min_samples:
+            return None
+        self.last = now
+        s = sorted(scores)
+        cand_t = self._bounded(self._quantile(s, self.budget_q), self.cur_threshold, self.anchor_threshold)
+        cand_r = self._bounded(self._quantile(s, self.ref_pct / 100.0), self.cur_ref, self.anchor_ref)
+        self.cur_threshold, self.cur_ref = cand_t, cand_r
+        return (cand_t, cand_r)
+
+
 def sniff_thread(args, device, model, masker, calib=None):
     tls_state = {}
     byte_buffer = bytearray()
@@ -505,13 +585,34 @@ def sniff_thread(args, device, model, masker, calib=None):
     elif meta_log.lower() == "none":
         meta_log = None
     meta = MetaEventReporter(args.summary_interval, trigger_alert_async, meta_log=meta_log)
+
+    # H.2 adaptive recalibration: rolling recent-score buffer + recalibrator.
+    recalib_scores = deque(maxlen=200000)
+    recal = [None]  # boxed so finish_calibration can (re)build it
+
+    def build_recalibrator(c):
+        if not args.adaptive_recalib or c is None:
+            return None
+        return AdaptiveRecalibrator(
+            budget_q=c.get("budget_quantile"),
+            ref_pct=args.cusum_ref_pct,
+            anchor_threshold=c.get("anchor_threshold", args.byte_threshold),
+            anchor_ref=cusum_ref(c),
+            interval=args.recalib_interval, max_step=args.recalib_max_step,
+            cap=args.recalib_cap, min_samples=args.recalib_min_samples,
+        )
+
     if calib is not None:
         meta.set_calib(calib)
         if cusum is not None and calib.get("mean") is not None:
             cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
+        recal[0] = build_recalibrator(calib)
     if cusum is not None:
         logging.info(f"CUSUM slow-low detector ON (k={args.cusum_k_sigma}sigma, h={args.cusum_h} bits); "
                      f"meta-event summary every {args.summary_interval:.0f}s -> {meta_log}")
+    if args.adaptive_recalib:
+        logging.info(f"Adaptive recalibration ON (every {args.recalib_interval:.0f}s, "
+                     f"step +/-{args.recalib_max_step} bits, cap +/-{args.recalib_cap} bits from anchor)")
 
     # --- CALIBRATION MODE STATE ---
     is_learning = args.learning_time > 0
@@ -543,6 +644,8 @@ def sniff_thread(args, device, model, masker, calib=None):
             logging.info(f" CUSUM reference = p{args.cusum_ref_pct:g} surprise "
                          f"({cusum.reference:.2f} bits), leak {args.cusum_leak}, h {args.cusum_h}")
         args.byte_threshold = calib["byte_threshold"]
+        recal[0] = build_recalibrator(calib)   # fresh anchor for adaptive recalibration
+        recalib_scores.clear()
         is_learning = False
         logging.info("=================================================")
         logging.info(f" CALIBRATION COMPLETE for '{args.interface}'")
@@ -573,6 +676,20 @@ def sniff_thread(args, device, model, masker, calib=None):
             aggregator.flush()
             if not is_learning:
                 meta.maybe_summarize(now)  # hourly meta-event + drift check
+                # H.2 adaptive recalibration: re-fit threshold + CUSUM ref on recent traffic
+                if recal[0] is not None:
+                    res = recal[0].maybe(recalib_scores, now)
+                    if res is not None:
+                        new_thr, new_ref = res
+                        old_thr = args.byte_threshold
+                        args.byte_threshold = new_thr
+                        if cusum is not None:
+                            cusum.reference = new_ref
+                        persist_adapted_threshold(args.interface, new_thr, new_ref)
+                        logging.info(f"[ADAPTIVE] recalibrated: byte_threshold {old_thr:.2f} -> "
+                                     f"{new_thr:.2f}, CUSUM ref -> {new_ref:.2f} "
+                                     f"(anchor {recal[0].anchor_threshold:.2f}, from {len(recalib_scores)} windows)")
+                        trigger_alert_async("INFO", f"Adaptive recalibration: threshold now {new_thr:.2f} bits")
             syn_count = 0
             current_bucket = t_bucket
 
@@ -635,7 +752,8 @@ def sniff_thread(args, device, model, masker, calib=None):
                     if (time.time() - learning_start) > args.learning_time:
                         finish_calibration()  # transitions to LIVE in-place, no restart needed
                 else:
-                    meta.record_score(window_score)  # for the drift (PSI) check
+                    meta.record_score(window_score)   # for the drift (PSI) check
+                    recalib_scores.append(window_score)  # for H.2 adaptive recalibration
 
                     # A.1 CUSUM: accumulate this flow's surprise for slow-low detection
                     if cusum is not None:
