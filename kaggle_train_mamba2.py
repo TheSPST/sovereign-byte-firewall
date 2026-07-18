@@ -79,7 +79,33 @@ def step1_repo():
     run(["git", "config", "user.name", "kaggle-training-bot"])
     run(["git", "checkout", BRANCH])
     run(["git", "pull", "origin", BRANCH])
-    run(["git", "merge", "origin/main", "-m", "merge main into mamba branch"])
+
+    merge = subprocess.run(
+        ["git", "merge", "origin/main", "-m", "merge main into mamba branch"],
+        capture_output=True, text=True,
+    )
+    print(merge.stdout, merge.stderr)
+    if merge.returncode != 0:
+        conflicted = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            capture_output=True, text=True,
+        ).stdout.split()
+        print("Conflicted files:", conflicted)
+        non_docs = [f for f in conflicted if not f.endswith(".md")]
+        if non_docs:
+            raise RuntimeError(
+                f"Merge conflict in non-doc file(s) {non_docs} — this touches real code, "
+                f"not just docs, so it needs a human judgment call. Resolve manually inside "
+                f"{REPO_DIR} (edit the conflict markers, `git add`, `git commit`), then re-run."
+            )
+        # Docs-only conflict (e.g. PROJECT_CONTEXT.md) — safe to auto-resolve: keep this
+        # branch's version and move on, since it doesn't affect training correctness.
+        for f in conflicted:
+            run(["git", "checkout", "--ours", f])
+            run(["git", "add", f])
+        run(["git", "commit", "--no-edit"])
+        print("Docs-only merge conflict auto-resolved (kept mamba-branch version of):", conflicted)
+
     log = subprocess.run(["git", "log", "--oneline", "-5"], capture_output=True, text=True).stdout
     print(log)
 
