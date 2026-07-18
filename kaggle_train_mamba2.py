@@ -74,6 +74,9 @@ def step1_repo():
     else:
         run(["git", "clone", REPO_URL, REPO_DIR])
     os.chdir(REPO_DIR)
+    # merge commits need an identity — Kaggle containers have none set by default
+    run(["git", "config", "user.email", "kaggle-bot@users.noreply.github.com"])
+    run(["git", "config", "user.name", "kaggle-training-bot"])
     run(["git", "checkout", BRANCH])
     run(["git", "pull", "origin", BRANCH])
     run(["git", "merge", "origin/main", "-m", "merge main into mamba branch"])
