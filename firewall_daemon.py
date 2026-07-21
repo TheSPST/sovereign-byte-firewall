@@ -23,7 +23,7 @@ from collections import deque, Counter
 
 import torch
 import torch.nn.functional as F
-from scapy.all import sniff, TCP, IP, UDP
+from scapy.all import AsyncSniffer, TCP, IP, UDP
 
 from src.model import NetworkBytePatcher
 from src.dataloader import RawPcapIterableDataset
@@ -161,6 +161,13 @@ def parse_args():
                         help="Minimum recent windows before an adaptive recalibration fires (default 5000)")
     parser.add_argument("--meta_log", type=str, default=None,
                         help="CSV for hourly meta-event summaries (default: meta_events_<interface>.csv; 'none' to disable)")
+    parser.add_argument("--sniff_retry_secs", type=float, default=10.0,
+                        help="Seconds between capture restart attempts after the interface drops "
+                             "(e.g. Wi-Fi flap during a long run; default 10)")
+    parser.add_argument("--sniff_stall_timeout", type=float, default=300.0,
+                        help="Restart capture if no packet arrives for this many seconds (catches the "
+                             "silent-stall failure mode where the interface dies without an error; "
+                             "0 = disable; default 300)")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length for byte patcher")
     parser.add_argument("--ws_port", type=int, default=8765, help="WebSocket port for dashboard")
     return parser.parse_args()
@@ -546,6 +553,97 @@ class AdaptiveRecalibrator:
         return (cand_t, cand_r)
 
 
+# ---------------------------------------------------------------------------
+# Resilient capture supervisor (Wi-Fi flap / interface-down survival)
+# ---------------------------------------------------------------------------
+
+def log_capture_gap(incident_log, gap_start, gap_end):
+    """Append a CAPTURE_GAP row to the incident CSV (same schema as incidents)
+    so downtime can be excluded from incidents/day math instead of silently
+    deflating it."""
+    if not incident_log:
+        return
+    try:
+        ctx = f"{{'gap_seconds':{gap_end - gap_start:.0f}}}"
+        with open(incident_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(gap_start))},"
+                    f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(gap_end))},"
+                    f"CAPTURE_GAP,0,0.00,\"{ctx}\"\n")
+    except OSError as e:
+        logging.warning(f"Could not write capture-gap marker: {e}")
+
+
+def run_capture_supervised(iface, packet_callback, last_pkt, incident_log,
+                           retry_secs=10.0, stall_timeout=300.0,
+                           sniffer_factory=None, poll_secs=5.0, max_restarts=None):
+    """Keep the capture alive across interface flaps (e.g. Wi-Fi drops during a
+    long unattended run).
+
+    scapy's blocking sniff() has two failure modes when the interface goes
+    down: it raises (previously killing the capture thread while the WebSocket
+    server kept the dashboard looking healthy), or it silently stops
+    delivering packets. This supervisor uses AsyncSniffer and handles both:
+    a dead sniffer thread or a packet stall (> stall_timeout with zero
+    packets) triggers a restart with retry, and every outage is logged to the
+    incident CSV as a CAPTURE_GAP row so incidents/day can be computed over
+    actual capture uptime.
+
+    last_pkt: single-element list holding the timestamp of the last packet
+    seen (updated by packet_callback). max_restarts is for tests (None = run
+    forever).
+    """
+    if sniffer_factory is None:
+        def sniffer_factory():
+            return AsyncSniffer(iface=iface, prn=packet_callback, store=False)
+    gap_start = None
+    restarts = 0
+    while True:
+        sniffer = sniffer_factory()
+        try:
+            sniffer.start()
+            time.sleep(min(1.0, poll_secs))  # let a bad interface fail fast
+            thread = getattr(sniffer, "thread", None)
+            if thread is not None and not thread.is_alive():
+                exc = getattr(sniffer, "exception", None)
+                if isinstance(exc, PermissionError):
+                    raise exc
+                raise OSError(str(exc) if exc else "sniffer failed to start (interface down?)")
+            if gap_start is not None:
+                gap_end = time.time()
+                log_capture_gap(incident_log, gap_start, gap_end)
+                logging.warning(f"Capture RESUMED on '{iface}' after {gap_end - gap_start:.0f}s gap"
+                                + (f" (CAPTURE_GAP row appended to {incident_log})" if incident_log else ""))
+                gap_start = None
+            last_pkt[0] = time.time()
+            while True:  # watchdog loop while the sniffer runs
+                time.sleep(poll_secs)
+                thread = getattr(sniffer, "thread", None)
+                if thread is not None and not thread.is_alive():
+                    exc = getattr(sniffer, "exception", None)
+                    if isinstance(exc, PermissionError):
+                        raise exc
+                    raise OSError(str(exc) if exc else "sniffer thread died (interface down?)")
+                if stall_timeout and (time.time() - last_pkt[0]) > stall_timeout:
+                    raise OSError(f"no packets for {stall_timeout:.0f}s (silent capture stall - interface flap?)")
+        except PermissionError:
+            logging.error("Permission denied! Sniffing live traffic requires root privileges. Try running with 'sudo'.")
+            return
+        except Exception as e:
+            try:
+                sniffer.stop(join=False)
+            except Exception:
+                pass
+            if gap_start is None:
+                gap_start = time.time()
+                logging.error(f"Sniffer down: {e} - retrying every {retry_secs:.0f}s until '{iface}' returns "
+                              "(gap will be marked in the incident CSV on resume).")
+            restarts += 1
+            if max_restarts is not None and restarts >= max_restarts:
+                log_capture_gap(incident_log, gap_start, time.time())
+                return
+            time.sleep(retry_secs)
+
+
 def sniff_thread(args, device, model, masker, calib=None):
     tls_state = {}
     byte_buffer = bytearray()
@@ -556,6 +654,10 @@ def sniff_thread(args, device, model, masker, calib=None):
     # Rolling packet-metadata ring buffer (~last 10s) for incident enrichment.
     META_WINDOW = 10.0
     pkt_meta = deque()
+
+    # Timestamp of the last captured packet (boxed for the capture supervisor's
+    # stall watchdog).
+    last_pkt = [time.time()]
 
     incident_log = args.incident_log
     if incident_log is None:
@@ -662,6 +764,7 @@ def sniff_thread(args, device, model, masker, calib=None):
         nonlocal byte_buffer, current_bucket, syn_count, tls_state
 
         now = time.time()
+        last_pkt[0] = now
         is_syn = bool(TCP in packet and packet[TCP].flags & 0x02)
 
         # 1. Rate Detector (SYN Flood Check)
@@ -788,12 +891,9 @@ def sniff_thread(args, device, model, masker, calib=None):
                             logging.critical(f"[BYTE ALARM] {msg}")
                             meta.record_incident("BYTE", enrich)
 
-    try:
-        sniff(iface=args.interface, prn=packet_callback, store=False)
-    except PermissionError:
-        logging.error("Permission denied! Sniffing live traffic requires root privileges. Try running with 'sudo'.")
-    except Exception as e:
-        logging.error(f"Sniffer crashed: {e}")
+    run_capture_supervised(args.interface, packet_callback, last_pkt, incident_log,
+                           retry_secs=args.sniff_retry_secs,
+                           stall_timeout=args.sniff_stall_timeout)
 
 async def main_async():
     global loop
