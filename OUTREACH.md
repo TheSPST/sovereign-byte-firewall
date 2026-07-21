@@ -16,7 +16,7 @@ It's a byte-level model that reads raw traffic (a span port or a pcap you send) 
 What it's shown so far, stated honestly:
 - On CIC-IDS2017 it caught 5/5 attack campaigns (Hulk, GoldenEye, Slowloris, Slowhttptest, Heartbleed) at ~1 false alarm/hour.
 - Trained only on one dataset's benign traffic, it transferred to a completely separate dataset (UNSW-NB15) with near-identical separation (AUC 0.75 vs 0.73) — it learned general "normal," not one capture.
-- On my own live network it runs at [LIVE_FP] incidents/day after a one-hour baseline.
+- On my own live network it runs at 326 incidents/day (unaggregated) after a one-hour baseline.
 - What it does *not* do: read inside encrypted tunnels, catch a patient sub-threshold attacker, or replace your stack. It's an additional layer. (I keep a written limitations doc; happy to share.)
 
 The pilot: give me one week of pcap (or a span port), read-only, fixed fee. I return an incident report, the false-positive rate on *your* traffic, and a live demo of it catching replayed attacks against your baseline. If it surfaces nothing your stack didn't already catch, you've cheaply proven your coverage — also a result.

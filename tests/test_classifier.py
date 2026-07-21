@@ -1,8 +1,9 @@
 import os
+import tempfile
 import torch
 import numpy as np
 import pytest
-from torch.utils.data import TensorDataset, DataLoader
+from scapy.all import IP, TCP, wrpcap
 from src.model import NetworkBytePatcher
 from run_classifier import extract_packet_features
 
@@ -14,29 +15,24 @@ def test_feature_extraction():
     model = NetworkBytePatcher(d_model=64, nhead=2, num_layers=1).to(device)
     model.eval()
     
-    # Create mock dataloader containing 4 sample sequences of length 128
-    dummy_input = torch.randint(0, 256, (4, 128))
-    dataset = TensorDataset(dummy_input)
-    dataloader = DataLoader(dataset, batch_size=2)
+    # Create 4 mock TCP packets (size 128 bytes each: 20 IP + 20 TCP + 88 payload)
+    packets = [IP(dst="192.168.1.1")/TCP()/("A"*88) for _ in range(4)]
     
-    # We must mock the dataloader iteration because get_pcap_dataloader yields tensors directly,
-    # whereas standard TensorDataset returns tuples. We override the dataloader yield format:
-    class MockDataloaderWrapper:
-        def __init__(self, dl):
-            self.dl = dl
-        def __iter__(self):
-            for batch in self.dl:
-                yield batch[0]
-                
-    wrapped_dl = MockDataloaderWrapper(dataloader)
-    
-    # Run feature extraction
-    features = extract_packet_features(model, wrapped_dl, device)
-    
-    print(f"Extracted features shape: {features.shape}")
-    assert features.shape == (4, 64), f"Expected shape (4, 64), got {features.shape}"
-    assert np.isnan(features).sum() == 0, "Extracted features contain NaN values!"
-    print("Feature extraction verified successfully!")
+    fd, temp_pcap_path = tempfile.mkstemp(suffix=".pcap")
+    os.close(fd)
+    try:
+        wrpcap(temp_pcap_path, packets)
+        
+        # Run feature extraction with seq_len=128
+        features = extract_packet_features(model, temp_pcap_path, device, batch_size=2, seq_len=128)
+        
+        print(f"Extracted features shape: {features.shape}")
+        assert features.shape == (4, 64), f"Expected shape (4, 64), got {features.shape}"
+        assert np.isnan(features).sum() == 0, "Extracted features contain NaN values!"
+        print("Feature extraction verified successfully!")
+    finally:
+        if os.path.exists(temp_pcap_path):
+            os.remove(temp_pcap_path)
 
 def test_classifier_flow():
     print("=== Testing Downstream Classifier Training Flow ===")
