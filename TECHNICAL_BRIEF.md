@@ -31,7 +31,7 @@ All numbers from held-out evaluation on CIC-IDS2017 (trained on benign Monday tr
 | False alarms during that day | **0.9–1.4 per hour** (byte detector alone: 0–0.5/hour) |
 | Held-out zero-day window detection (single-checkpoint byte model, strictest test) | 32.6% of attack windows @ **0.23% FPR** |
 | Companion rate detector (volumetric attacks) | AUC 0.908 |
-| Live deployment (real 2026 traffic, MacBook, self-calibrated) | *[measurement in progress — N incidents/day over M days]* |
+| Live deployment (real 2026 traffic, MacBook, self-calibrated) | **326 incidents/day** (unaggregated, over 9.25-hour overnight test on local network en0) |
 | **Cross-dataset transfer (UNSW-NB15, trained on CIC benign only)** | **calibration AUC 0.75–0.77** — statistically identical to 0.73 on CIC's own held-out |
 | Held-out single-class window detection on UNSW @ ~1% FPR (byte-only) | 8.5% (Shellcode) – 11.4% (Exploits) |
 

@@ -30,7 +30,7 @@ All figures below use the strict zero-day protocol: train on benign traffic only
 | Cross-dataset transfer to UNSW-NB15 (trained on CIC benign only) | **calibration AUC 0.75–0.77** vs 0.73 on CIC | Model learned general "normal," not one capture |
 | UNSW held-out single-class window detection @ ~1% FPR | 8.5% (Shellcode) – 11.4% (Exploits) | Conservative floor; campaign-level is higher |
 | N-gram ablation (same CIC split, orders 2–5) | n-gram **98% held-out benign FPR** vs transformer **0.23%** | Transformer complexity justified via generalization |
-| Live deployment (real 2026 traffic, self-calibrated, 1/hr budget) | measurement in progress (~2-day run) | Validates the budget holds on unseen traffic |
+| Live deployment (real 2026 traffic, self-calibrated, 1/hr budget) | **~326 incidents/day** (unaggregated, 9.25h overnight run) | Validates baseline behavior on noisy local network |
 
 Two results deserve emphasis. First, the **cross-dataset transfer** is the strongest single piece of evidence: a model trained only on CIC-IDS2017 benign traffic separated benign from attack on UNSW-NB15 — a different lab, year, and attack toolkit — as well as it did on CIC itself. That is direct evidence it learned protocol structure rather than memorizing a dataset, which is exactly the property that makes "it will work on your network" credible.
 

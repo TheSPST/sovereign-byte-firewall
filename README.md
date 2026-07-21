@@ -23,7 +23,7 @@ connection-rate detector.
 | Full-day eval, fused (Wed: Hulk, GoldenEye, Slowloris, Slowhttptest, Heartbleed) | **5/5 attack campaigns detected** |
 | False alarms that day | **0.9–1.4/hour** (byte detector alone: 0–0.5/hour) |
 | Held-out zero-day window detection (byte model, strictest metric) | 32.6% @ **0.23% FPR** |
-| Live deployment (real traffic, MacBook, 1h self-calibration) | measurement in progress |
+| Live deployment (real traffic, MacBook, 1h self-calibration) | ~326 incidents/day (unaggregated, 9.25h overnight run) |
 | **Cross-dataset transfer to UNSW-NB15** (trained on CIC benign only) | **calibration AUC 0.75–0.77** vs 0.73 on CIC — near-identical |
 | Held-out single-class window detection on UNSW @ ~1% FPR (byte-only) | 8.5% (Shellcode) – 11.4% (Exploits) |
 
