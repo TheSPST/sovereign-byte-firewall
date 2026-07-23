@@ -27,6 +27,7 @@ from scapy.all import AsyncSniffer, TCP, IP, UDP
 
 from src.model import NetworkBytePatcher
 from src.dataloader import RawPcapIterableDataset
+from src.fast_sniffer import parse_packet_fast
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -161,6 +162,10 @@ def parse_args():
                         help="Minimum recent windows before an adaptive recalibration fires (default 5000)")
     parser.add_argument("--meta_log", type=str, default=None,
                         help="CSV for hourly meta-event summaries (default: meta_events_<interface>.csv; 'none' to disable)")
+    parser.add_argument("--fast_sniffer", action="store_true", default=True,
+                        help="Use C-struct zero-Scapy fast packet parser (default on)")
+    parser.add_argument("--no_fast_sniffer", dest="fast_sniffer", action="store_false",
+                        help="Disable fast sniffer and fall back to Scapy object trees")
     parser.add_argument("--sniff_retry_secs", type=float, default=10.0,
                         help="Seconds between capture restart attempts after the interface drops "
                              "(e.g. Wi-Fi flap during a long run; default 10)")
@@ -820,9 +825,17 @@ def sniff_thread(args, device, model, masker, calib=None):
         if not raw_bytes:
             return
 
-        # Capture packet metadata for incident enrichment (cheap, best-effort).
+        # Capture packet metadata for incident enrichment (cheap, zero-copy fast parser).
         try:
-            if IP in packet:
+            parsed = parse_packet_fast(raw_bytes) if args.fast_sniffer else None
+            if parsed is not None:
+                src_ip, dst_ip, dport, proto, fast_syn = parsed
+                if is_syn is False and fast_syn:
+                    is_syn = True
+                pkt_meta.append((now, src_ip, dst_ip, 0, dport, proto, len(raw_bytes), is_syn))
+                last_pair[0] = frozenset((src_ip, dst_ip))   # flow key for CUSUM
+                last_dst[0] = f"{dst_ip}:{dport}"             # target key for CUSUM
+            elif IP in packet:
                 ipl = packet[IP]
                 if TCP in packet:
                     proto, dport = "TCP", packet[TCP].dport
@@ -833,9 +846,9 @@ def sniff_thread(args, device, model, masker, calib=None):
                 pkt_meta.append((now, ipl.src, ipl.dst, 0, dport, proto, len(raw_bytes), is_syn))
                 last_pair[0] = frozenset((ipl.src, ipl.dst))  # flow key for CUSUM
                 last_dst[0] = f"{ipl.dst}:{dport}"            # target key for CUSUM
-                cutoff = now - META_WINDOW
-                while pkt_meta and pkt_meta[0][0] < cutoff:
-                    pkt_meta.popleft()
+            cutoff = now - META_WINDOW
+            while pkt_meta and pkt_meta[0][0] < cutoff:
+                pkt_meta.popleft()
         except Exception:
             pass
 
