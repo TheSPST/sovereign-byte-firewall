@@ -541,9 +541,13 @@ class AdaptiveRecalibrator:
         cand = min(anchor + self.cap, max(anchor - self.cap, cand))          # frozen-anchor cap
         return cand
 
-    def maybe(self, scores, now):
+    def maybe(self, scores, now, psi=None, max_psi=0.40):
         """Returns (new_threshold, new_ref) if it recalibrated, else None."""
         if not self.enabled or (now - self.last) < self.interval or len(scores) < self.min_samples:
+            return None
+        if psi is not None and psi > max_psi:
+            logging.warning(f"[ADAPTIVE] Recalibration FROZEN due to high structural drift (PSI {psi:.3f} > {max_psi:.2f})")
+            self.last = now
             return None
         self.last = now
         s = sorted(scores)
@@ -671,7 +675,10 @@ def sniff_thread(args, device, model, masker, calib=None):
     # A.1 CUSUM slow-low detector + A.2 hourly meta-event reporter
     cusum = CusumTracker(k_sigma=args.cusum_k_sigma, h=args.cusum_h,
                          leak=args.cusum_leak) if args.enable_cusum else None
+    target_cusum = CusumTracker(k_sigma=args.cusum_k_sigma, h=args.cusum_h,
+                                leak=args.cusum_leak) if args.enable_cusum else None
     last_pair = [None]  # dominant flow of the most recent packet (host-pair)
+    last_dst = [None]   # dominant target of the most recent packet (dst_ip:dst_port)
 
     def cusum_ref(c):
         """CUSUM reference = the args.cusum_ref_pct benign percentile of surprise
@@ -706,8 +713,11 @@ def sniff_thread(args, device, model, masker, calib=None):
 
     if calib is not None:
         meta.set_calib(calib)
-        if cusum is not None and calib.get("mean") is not None:
-            cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
+        if calib.get("mean") is not None:
+            if cusum is not None:
+                cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
+            if target_cusum is not None:
+                target_cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
         recal[0] = build_recalibrator(calib)
     if cusum is not None:
         logging.info(f"CUSUM slow-low detector ON (k={args.cusum_k_sigma}sigma, h={args.cusum_h} bits); "
@@ -743,8 +753,12 @@ def sniff_thread(args, device, model, masker, calib=None):
         meta.set_calib(calib)
         if cusum is not None:
             cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
+        if target_cusum is not None:
+            target_cusum.set_baseline(calib["mean"], calib.get("std", 1.0), reference=cusum_ref(calib))
+        if cusum is not None or target_cusum is not None:
+            ref_val = cusum.reference if cusum else target_cusum.reference
             logging.info(f" CUSUM reference = p{args.cusum_ref_pct:g} surprise "
-                         f"({cusum.reference:.2f} bits), leak {args.cusum_leak}, h {args.cusum_h}")
+                         f"({ref_val:.2f} bits), leak {args.cusum_leak}, h {args.cusum_h}")
         args.byte_threshold = calib["byte_threshold"]
         recal[0] = build_recalibrator(calib)   # fresh anchor for adaptive recalibration
         recalib_scores.clear()
@@ -781,13 +795,16 @@ def sniff_thread(args, device, model, masker, calib=None):
                 meta.maybe_summarize(now)  # hourly meta-event + drift check
                 # H.2 adaptive recalibration: re-fit threshold + CUSUM ref on recent traffic
                 if recal[0] is not None:
-                    res = recal[0].maybe(recalib_scores, now)
+                    psi_val = meta._psi() if meta else None
+                    res = recal[0].maybe(recalib_scores, now, psi=psi_val)
                     if res is not None:
                         new_thr, new_ref = res
                         old_thr = args.byte_threshold
                         args.byte_threshold = new_thr
                         if cusum is not None:
                             cusum.reference = new_ref
+                        if target_cusum is not None:
+                            target_cusum.reference = new_ref
                         persist_adapted_threshold(args.interface, new_thr, new_ref)
                         logging.info(f"[ADAPTIVE] recalibrated: byte_threshold {old_thr:.2f} -> "
                                      f"{new_thr:.2f}, CUSUM ref -> {new_ref:.2f} "
@@ -815,6 +832,7 @@ def sniff_thread(args, device, model, masker, calib=None):
                     proto, dport = "other", 0
                 pkt_meta.append((now, ipl.src, ipl.dst, 0, dport, proto, len(raw_bytes), is_syn))
                 last_pair[0] = frozenset((ipl.src, ipl.dst))  # flow key for CUSUM
+                last_dst[0] = f"{ipl.dst}:{dport}"            # target key for CUSUM
                 cutoff = now - META_WINDOW
                 while pkt_meta and pkt_meta[0][0] < cutoff:
                     pkt_meta.popleft()
@@ -856,20 +874,40 @@ def sniff_thread(args, device, model, masker, calib=None):
                         finish_calibration()  # transitions to LIVE in-place, no restart needed
                 else:
                     meta.record_score(window_score)   # for the drift (PSI) check
-                    recalib_scores.append(window_score)  # for H.2 adaptive recalibration
 
-                    # A.1 CUSUM: accumulate this flow's surprise for slow-low detection
+                    # A.1 CUSUM: accumulate flow & target surprise for slow-low detection
+                    flow_alarmed, flow_level = False, 0.0
+                    target_alarmed, target_level = False, 0.0
                     if cusum is not None:
-                        alarmed, level = cusum.update(last_pair[0], window_score, now)
-                        if alarmed:
+                        flow_alarmed, flow_level = cusum.update(last_pair[0], window_score, now)
+                        if flow_alarmed:
                             pair = " <-> ".join(sorted(last_pair[0])) if last_pair[0] else "?"
-                            msg = (f"Slow/low anomaly: cumulative surprise {level:.1f} bits from {pair} "
+                            msg = (f"Slow/low anomaly: cumulative surprise {flow_level:.1f} bits from {pair} "
                                    f"(persistent sub-threshold activity)")
                             enr = compute_enrichment(pkt_meta)
-                            enr["cusum_level"] = round(level, 1)
-                            if aggregator.report("SLOW", msg, score=level, enrichment=enr):
+                            enr["cusum_level"] = round(flow_level, 1)
+                            if aggregator.report("SLOW", msg, score=flow_level, enrichment=enr):
                                 logging.warning(f"[SLOW ALARM] {msg}")
                                 meta.record_incident("SLOW", enr)
+
+                    if target_cusum is not None:
+                        target_alarmed, target_level = target_cusum.update(last_dst[0], window_score, now)
+                        if target_alarmed:
+                            target_str = last_dst[0] if last_dst[0] else "?"
+                            msg = (f"Slow/low distributed anomaly: cumulative surprise {target_level:.1f} bits targeting {target_str} "
+                                   f"(multi-source attack campaign)")
+                            enr = compute_enrichment(pkt_meta)
+                            enr["cusum_level"] = round(target_level, 1)
+                            if aggregator.report("SLOW_DISTRIBUTED", msg, score=target_level, enrichment=enr):
+                                logging.warning(f"[SLOW DISTRIBUTED ALARM] {msg}")
+                                meta.record_incident("SLOW_DISTRIBUTED", enr)
+
+                    is_byte_anomaly = window_score > args.byte_threshold
+                    is_any_anomaly = is_byte_anomaly or flow_alarmed or target_alarmed
+
+                    # Alert-Excluded Recalibration: only unflagged benign traffic votes on baseline re-fit
+                    if not is_any_anomaly:
+                        recalib_scores.append(window_score)
 
                     if window_score > args.byte_threshold:
                         pct = score_percentile(window_score, current_calib)
