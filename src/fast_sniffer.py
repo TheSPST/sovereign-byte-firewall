@@ -57,16 +57,16 @@ def parse_packet_fast(raw_bytes):
                 sport, dport = struct.unpack("!HH", raw_bytes[ip_offset:ip_offset + 4])
                 flags = raw_bytes[ip_offset + 13]
                 is_syn = bool(flags & 0x02)
-                return (src_ip, dst_ip, dport, "TCP", is_syn)
+                return (src_ip, sport, dst_ip, dport, "TCP", is_syn)
 
             elif proto == 17:  # UDP
                 if len(raw_bytes) < ip_offset + 4:
                     return None
                 sport, dport = struct.unpack("!HH", raw_bytes[ip_offset:ip_offset + 4])
-                return (src_ip, dst_ip, dport, "UDP", False)
+                return (src_ip, sport, dst_ip, dport, "UDP", False)
 
             else:
-                return (src_ip, dst_ip, 0, "other", False)
+                return (src_ip, 0, dst_ip, 0, "other", False)
 
         # 3. Parse IPv6 Header (0x86DD)
         elif ethertype == 0x86DD:
@@ -83,16 +83,16 @@ def parse_packet_fast(raw_bytes):
                 sport, dport = struct.unpack("!HH", raw_bytes[ip_offset:ip_offset + 4])
                 flags = raw_bytes[ip_offset + 13]
                 is_syn = bool(flags & 0x02)
-                return (src_ip, dst_ip, dport, "TCP", is_syn)
+                return (src_ip, sport, dst_ip, dport, "TCP", is_syn)
 
             elif proto == 17:  # UDP
                 if len(raw_bytes) < ip_offset + 4:
                     return None
                 sport, dport = struct.unpack("!HH", raw_bytes[ip_offset:ip_offset + 4])
-                return (src_ip, dst_ip, dport, "UDP", False)
+                return (src_ip, sport, dst_ip, dport, "UDP", False)
 
             else:
-                return (src_ip, dst_ip, 0, "other", False)
+                return (src_ip, 0, dst_ip, 0, "other", False)
 
     except Exception:
         return None

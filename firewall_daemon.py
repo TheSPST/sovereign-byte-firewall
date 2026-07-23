@@ -19,7 +19,7 @@ import json
 import threading
 import asyncio
 import websockets
-from collections import deque, Counter
+from collections import deque, Counter, defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -248,6 +248,7 @@ def save_calibration(interface, scores_tensor, elapsed_seconds=0.0, target_iph=0
         "score_metric": SCORE_METRIC,
         "byte_threshold": threshold,
         "anchor_threshold": threshold,  # frozen anchor for adaptive recalibration
+        "gold_threshold": round(threshold + 3.0, 4),  # hard static ceiling (never adapts)
         "threshold_method": method,
         "score_quantiles": score_quantiles,
         "target_incidents_per_hour": target_iph,
@@ -562,6 +563,44 @@ class AdaptiveRecalibrator:
         return (cand_t, cand_r)
 
 
+class FlowBufferManager:
+    """Manages per-flow byte queues to eliminate packet-interleaving noise.
+    Keyed by 4-tuple TCP/UDP flow: (src_ip, sport, dst_ip, dport).
+    Yields 512-byte windows strictly belonging to a single pure connection."""
+
+    MAX_FLOWS = 4096
+
+    def __init__(self, idle_ttl=300.0):
+        self.idle_ttl = idle_ttl
+        self.buffers = defaultdict(deque)
+        self.last_seen = {}
+
+    def add_bytes(self, flow_key, raw_bytes, now=None):
+        if not flow_key or not raw_bytes:
+            return
+        now = now if now is not None else time.time()
+        self.buffers[flow_key].extend(raw_bytes)
+        self.last_seen[flow_key] = now
+        self._evict(now)
+
+    def pop_windows(self, seq_len):
+        """Yields (flow_key, window_list) for all flows that have >= seq_len bytes."""
+        for flow_key, buf in list(self.buffers.items()):
+            while len(buf) >= seq_len:
+                window = [buf.popleft() for _ in range(seq_len)]
+                yield (flow_key, window)
+
+    def _evict(self, now):
+        cutoff = now - self.idle_ttl
+        for k in [k for k, t in self.last_seen.items() if t < cutoff]:
+            self.last_seen.pop(k, None)
+            self.buffers.pop(k, None)
+        while len(self.last_seen) > self.MAX_FLOWS:
+            oldest = min(self.last_seen, key=self.last_seen.get)
+            self.last_seen.pop(oldest, None)
+            self.buffers.pop(oldest, None)
+
+
 # ---------------------------------------------------------------------------
 # Resilient capture supervisor (Wi-Fi flap / interface-down survival)
 # ---------------------------------------------------------------------------
@@ -700,6 +739,9 @@ def sniff_thread(args, device, model, masker, calib=None):
         meta_log = None
     meta = MetaEventReporter(args.summary_interval, trigger_alert_async, meta_log=meta_log)
 
+    # Per-Flow Session Buffering (FlowBufferManager) to eliminate interleaved packet noise
+    flow_buffers = FlowBufferManager(idle_ttl=300.0)
+
     # H.2 adaptive recalibration: rolling recent-score buffer + recalibrator.
     recalib_scores = deque(maxlen=200000)
     recal = [None]  # boxed so finish_calibration can (re)build it
@@ -826,41 +868,40 @@ def sniff_thread(args, device, model, masker, calib=None):
             return
 
         # Capture packet metadata for incident enrichment (cheap, zero-copy fast parser).
+        flow_key = None
         try:
             parsed = parse_packet_fast(raw_bytes) if args.fast_sniffer else None
             if parsed is not None:
-                src_ip, dst_ip, dport, proto, fast_syn = parsed
+                src_ip, sport, dst_ip, dport, proto, fast_syn = parsed
                 if is_syn is False and fast_syn:
                     is_syn = True
-                pkt_meta.append((now, src_ip, dst_ip, 0, dport, proto, len(raw_bytes), is_syn))
+                pkt_meta.append((now, src_ip, dst_ip, sport, dport, proto, len(raw_bytes), is_syn))
                 last_pair[0] = frozenset((src_ip, dst_ip))   # flow key for CUSUM
                 last_dst[0] = f"{dst_ip}:{dport}"             # target key for CUSUM
+                flow_key = (src_ip, sport, dst_ip, dport)
             elif IP in packet:
                 ipl = packet[IP]
-                if TCP in packet:
-                    proto, dport = "TCP", packet[TCP].dport
-                elif UDP in packet:
-                    proto, dport = "UDP", packet[UDP].dport
-                else:
-                    proto, dport = "other", 0
-                pkt_meta.append((now, ipl.src, ipl.dst, 0, dport, proto, len(raw_bytes), is_syn))
+                sport = packet[TCP].sport if TCP in packet else (packet[UDP].sport if UDP in packet else 0)
+                dport = packet[TCP].dport if TCP in packet else (packet[UDP].dport if UDP in packet else 0)
+                proto = "TCP" if TCP in packet else ("UDP" if UDP in packet else "other")
+                pkt_meta.append((now, ipl.src, ipl.dst, sport, dport, proto, len(raw_bytes), is_syn))
                 last_pair[0] = frozenset((ipl.src, ipl.dst))  # flow key for CUSUM
                 last_dst[0] = f"{ipl.dst}:{dport}"            # target key for CUSUM
+                flow_key = (ipl.src, sport, ipl.dst, dport)
             cutoff = now - META_WINDOW
             while pkt_meta and pkt_meta[0][0] < cutoff:
                 pkt_meta.popleft()
         except Exception:
             pass
 
-        # 2. Byte-level Payload Detector
-        # Mask the packet
+        if flow_key is None:
+            flow_key = ("global", 0, "global", 0)
+
+        # 2. Byte-level Payload Detector (Per-Flow Session Buffering)
         masked = masker._mask_packet_addresses(raw_bytes, stream_tls_state=tls_state)
-        byte_buffer.extend(masked)
+        flow_buffers.add_bytes(flow_key, masked, now=now)
         
-        while len(byte_buffer) >= args.seq_len:
-            window = list(byte_buffer[:args.seq_len])
-            del byte_buffer[:args.seq_len]
-            
+        for fk, window in flow_buffers.pop_windows(args.seq_len):
             with torch.no_grad():
                 batch = torch.tensor([window], dtype=torch.long, device=device)
 
@@ -922,12 +963,15 @@ def sniff_thread(args, device, model, masker, calib=None):
                     if not is_any_anomaly:
                         recalib_scores.append(window_score)
 
-                    if window_score > args.byte_threshold:
-                        pct = score_percentile(window_score, current_calib)
-                        pct_str = f" ({pct}th pct of baseline)" if pct is not None else ""
-                        msg = (f"Payload anomaly detected! Surprise: {window_score:.2f} bits > "
-                               f"{args.byte_threshold:.2f}{pct_str}")
+                    # Check Static Gold Threshold Hard Ceiling
+                    gold_thr = current_calib.get("gold_threshold") if current_calib else (args.byte_threshold + 3.0)
+                    if window_score > gold_thr:
+                        msg = (f"CRITICAL: Hard static Gold Baseline ceiling breached! Surprise: {window_score:.2f} bits > "
+                               f"gold_threshold {gold_thr:.2f}")
                         enrich = compute_enrichment(pkt_meta)
+                        if aggregator.report("CRITICAL_BYTE", msg, score=window_score, enrichment=enrich):
+                            logging.critical(f"[CRITICAL BYTE ALARM] {msg}")
+                            meta.record_incident("CRITICAL_BYTE", enrich)
                         if pct is not None:
                             enrich["score_percentile"] = pct
                         # Per-byte surprise for the flagged window -> dashboard

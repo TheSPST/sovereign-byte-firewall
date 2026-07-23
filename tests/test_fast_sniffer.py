@@ -29,8 +29,9 @@ def test_parse_packet_fast_tcp_syn():
     raw = _build_tcp_packet(flags="S")
     parsed = parse_packet_fast(raw)
     assert parsed is not None
-    src_ip, dst_ip, dport, proto, is_syn = parsed
+    src_ip, sport, dst_ip, dport, proto, is_syn = parsed
     assert src_ip == "192.168.1.100"
+    assert sport == 12345
     assert dst_ip == "10.0.0.1"
     assert dport == 80
     assert proto == "TCP"
@@ -41,8 +42,9 @@ def test_parse_packet_fast_tcp_ack():
     raw = _build_tcp_packet(flags="A")
     parsed = parse_packet_fast(raw)
     assert parsed is not None
-    src_ip, dst_ip, dport, proto, is_syn = parsed
+    src_ip, sport, dst_ip, dport, proto, is_syn = parsed
     assert src_ip == "192.168.1.100"
+    assert sport == 12345
     assert dst_ip == "10.0.0.1"
     assert dport == 80
     assert proto == "TCP"
@@ -53,8 +55,9 @@ def test_parse_packet_fast_udp():
     raw = _build_udp_packet()
     parsed = parse_packet_fast(raw)
     assert parsed is not None
-    src_ip, dst_ip, dport, proto, is_syn = parsed
+    src_ip, sport, dst_ip, dport, proto, is_syn = parsed
     assert src_ip == "192.168.1.100"
+    assert sport == 5353
     assert dst_ip == "10.0.0.1"
     assert dport == 53
     assert proto == "UDP"
@@ -88,7 +91,7 @@ def test_fast_sniffer_speed_benchmark():
     for _ in range(iterations):
         fast_res = parse_packet_fast(raw_tcp)
         if fast_res is not None:
-            src, dst, dp, pr, syn = fast_res
+            src, sp, dst, dp, pr, syn = fast_res
     fast_time = time.perf_counter() - t0
 
     speedup = scapy_time / max(1e-6, fast_time)
