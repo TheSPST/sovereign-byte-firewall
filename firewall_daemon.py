@@ -28,6 +28,7 @@ from scapy.all import AsyncSniffer, TCP, IP, UDP
 from src.model import NetworkBytePatcher
 from src.dataloader import RawPcapIterableDataset
 from src.fast_sniffer import parse_packet_fast
+from src.eve_emitter import EveJsonEmitter
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -166,6 +167,12 @@ def parse_args():
                         help="Use C-struct zero-Scapy fast packet parser (default on)")
     parser.add_argument("--no_fast_sniffer", dest="fast_sniffer", action="store_false",
                         help="Disable fast sniffer and fall back to Scapy object trees")
+    parser.add_argument("--eve_log", type=str, default="eve.json",
+                        help="Path for Suricata-compatible EVE-JSON log (default: eve.json; 'none' to disable)")
+    parser.add_argument("--syslog_host", type=str, default=None,
+                        help="Optional UDP Syslog host (e.g. 192.168.1.50)")
+    parser.add_argument("--syslog_port", type=int, default=514,
+                        help="UDP Syslog port (default 514)")
     parser.add_argument("--sniff_retry_secs", type=float, default=10.0,
                         help="Seconds between capture restart attempts after the interface drops "
                              "(e.g. Wi-Fi flap during a long run; default 10)")
@@ -280,11 +287,12 @@ class IncidentAggregator:
     summarized when the incident goes quiet. Turns alert storms (e.g. one
     sustained flood = hundreds of raw alerts) into a handful of incidents."""
 
-    def __init__(self, window_seconds, alert_fn, incident_log=None):
+    def __init__(self, window_seconds, alert_fn, incident_log=None, eve_emitter=None):
         self.window = window_seconds
         self.alert_fn = alert_fn
         self.incidents = {}  # key -> {first_ts, last_ts, count, max_score}
         self.incident_log = incident_log
+        self.eve_emitter = eve_emitter
         if incident_log and not os.path.exists(incident_log):
             with open(incident_log, "w") as f:
                 f.write("opened_at,closed_at,type,raw_alerts,peak_score,context\n")
@@ -295,6 +303,8 @@ class IncidentAggregator:
         through to the WS payload and the incident-log context column."""
         if self.window <= 0:
             self.alert_fn(key, message, score, enrichment)
+            if self.eve_emitter:
+                self.eve_emitter.emit(key, message, score, enrichment)
             return True
         now = time.time()
         inc = self.incidents.get(key)
@@ -306,6 +316,8 @@ class IncidentAggregator:
                                    "max_score": score if score is not None else 0.0,
                                    "enrichment": enrichment or {}}
             self.alert_fn(key, message, score, enrichment)
+            if self.eve_emitter:
+                self.eve_emitter.emit(key, message, score, enrichment, timestamp=now)
             return True
         inc["count"] += 1
         inc["last_ts"] = now
@@ -327,6 +339,8 @@ class IncidentAggregator:
                    f"(peak score {inc['max_score']:.2f})")
             logging.warning(f"[{key} INCIDENT] {msg}")
             self.alert_fn(key, msg, inc["max_score"], inc.get("enrichment"))
+            if self.eve_emitter:
+                self.eve_emitter.emit(key, msg, inc["max_score"], inc.get("enrichment"), timestamp=inc["last_ts"])
         if self.incident_log:
             try:
                 # context = compact JSON of the opening enrichment (CSV-safe: quoted).
@@ -714,7 +728,17 @@ def sniff_thread(args, device, model, masker, calib=None):
         incident_log = None
     if incident_log:
         logging.info(f"Incident log: {incident_log}")
-    aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async, incident_log=incident_log)
+
+    eve_log = args.eve_log
+    if eve_log and eve_log.lower() == "none":
+        eve_log = None
+    eve_emitter = EveJsonEmitter(eve_log_path=eve_log, syslog_host=args.syslog_host, syslog_port=args.syslog_port) if (eve_log or args.syslog_host) else None
+    if eve_log:
+        logging.info(f"EVE-JSON SIEM Log: {eve_log}")
+    if args.syslog_host:
+        logging.info(f"Syslog RFC 5424 streaming -> {args.syslog_host}:{args.syslog_port}")
+
+    aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async, incident_log=incident_log, eve_emitter=eve_emitter)
 
     # A.1 CUSUM slow-low detector + A.2 hourly meta-event reporter
     cusum = CusumTracker(k_sigma=args.cusum_k_sigma, h=args.cusum_h,
