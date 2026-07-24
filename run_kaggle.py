@@ -20,6 +20,7 @@ import subprocess
 import torch
 from src.dataloader import get_pcap_dataloader
 from src.model import NetworkBytePatcher
+from src.model_mamba import MambaBytePatcher
 from src.training import train_patcher_on_kosh
 
 def str2bool(v):
@@ -142,6 +143,33 @@ def parse_args():
              "OFF by default: the masking scheme changed (TLS continuation, header "
              "stochastic fields, QUIC), so resuming a checkpoint trained under the OLD "
              "preprocessing silently mixes incompatible data distributions."
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="transformer",
+        choices=["transformer", "mamba"],
+        help="Model architecture to train: 'transformer' (NetworkBytePatcher, default) "
+             "or 'mamba' (MambaBytePatcher with Mamba-2 SSM backbone)."
+    )
+    parser.add_argument(
+        "--d_model",
+        type=int,
+        default=128,
+        help="Hidden dimension for both model types (default: 128)"
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=2,
+        help="Number of stacked blocks for both model types (default: 2)"
+    )
+    parser.add_argument(
+        "--hf_repo_id",
+        type=str,
+        default=None,
+        help="HuggingFace repo ID to push checkpoint to after training "
+             "(e.g. spst01/sovereign-byte-firewall-mamba2). If None, no push."
     )
     return parser.parse_args()
 
@@ -286,13 +314,26 @@ def main():
         label_anomalies=args.label_anomalies
     )
     
-    print("Initializing NetworkBytePatcher (ultra-lightweight configuration)...")
-    model = NetworkBytePatcher(
-        d_model=128,
-        nhead=4,
-        num_layers=2,
-        max_sequence_length=max_sequence_length
-    )
+    if args.model_type == "mamba":
+        print(f"Initializing MambaBytePatcher (Mamba-2 SSM backbone, d_model={args.d_model}, "
+              f"num_layers={args.num_layers})...")
+        model = MambaBytePatcher(
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            max_sequence_length=max_sequence_length,
+            variant="mamba2",
+        )
+        ckpt_name = "ckpt_mamba2.pt"
+    else:
+        print(f"Initializing NetworkBytePatcher (Transformer, d_model={args.d_model}, "
+              f"num_layers={args.num_layers})...")
+        model = NetworkBytePatcher(
+            d_model=args.d_model,
+            nhead=4,
+            num_layers=args.num_layers,
+            max_sequence_length=max_sequence_length
+        )
+        ckpt_name = "latest_patcher.pt"
 
     model = model.to(device)
 
