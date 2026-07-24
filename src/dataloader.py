@@ -624,9 +624,13 @@ def get_pcap_dataloader(pcap_path, batch_size=None, num_workers=None, max_sequen
         label_anomalies=label_anomalies
     )
     
-    return DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        num_workers=num_workers,
-        pin_memory=True # Crucial for fast CPU-to-GPU memory transfers
-    )
+    dl_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": True,
+    }
+    if num_workers > 0:
+        dl_kwargs["prefetch_factor"] = 8
+        dl_kwargs["persistent_workers"] = True
+
+    return DataLoader(dataset, **dl_kwargs)
