@@ -208,7 +208,6 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length,
         batch_size=batch_size,
         num_workers=num_workers,
         max_sequence_length=max_sequence_length,
-        pin_memory=(device.type == "cuda"),
         # Eval must not pollute data/anomaly_labels.csv with side-channel rows,
         # and skipping the per-packet scapy parse roughly halves scoring time.
         label_anomalies=False,
