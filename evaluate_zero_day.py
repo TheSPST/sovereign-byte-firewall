@@ -420,10 +420,14 @@ def main():
 
     model, max_seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
 
-    # Wrap with DataParallel if multiple GPUs are available
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
+    # Wrap with DataParallel if multiple GPUs are available (only for pure PyTorch models;
+    # native mamba_ssm Triton kernels are not thread-safe inside DataParallel).
+    has_native_mamba = getattr(model, 'is_native_mamba', False)
+    if device.type == "cuda" and torch.cuda.device_count() > 1 and not has_native_mamba:
         print(f"Multi-GPU: wrapping model with DataParallel across {torch.cuda.device_count()} GPUs")
         model = torch.nn.DataParallel(model)
+    elif has_native_mamba:
+        print("Native mamba-ssm Triton kernels active: running single-GPU high-speed inference.")
 
     print(f"Batch size: {args.batch_size} | DataLoader workers: {args.num_workers}")
 

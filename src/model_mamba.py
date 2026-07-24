@@ -157,8 +157,8 @@ class MambaBytePatcher(nn.Module):
             backend = "mamba1"
         else:
             backend = "mamba2_torch" if want2 else "torch_scan"
-
         ds = d_state if d_state is not None else (64 if "mamba2" in backend else 16)
+        self.is_native_mamba = backend in ("mamba1", "mamba2")
 
         def make_block():
             if backend == "mamba2":
