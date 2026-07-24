@@ -139,8 +139,8 @@ def load_model(checkpoint_path, device, override_seq_len=None):
     # N rows of the same embedding table, which is always valid since N <= native size.
     is_mamba = any("A_log" in k or "conv1d" in k for k in state_dict.keys())
     if is_mamba:
-        from src.mamba_model import Mamba2NetworkBytePatcher
-        model = Mamba2NetworkBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
+        from src.model_mamba import MambaBytePatcher
+        model = MambaBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
         print(f"Detected Mamba-2 Backbone Checkpoint")
     else:
         model = NetworkBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
