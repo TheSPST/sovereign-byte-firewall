@@ -256,8 +256,9 @@ def configure_hardware_limits(args):
                 max_sequence_length = 2048
                 print(f"  -> Capped max_sequence_length to: {max_sequence_length} bytes")
                 
-            # Allow up to 16 samples per GPU in batch
-            max_batch_per_gpu = 16
+            # Allow up to 256 samples per GPU for Mamba models (16 for legacy Transformer)
+            is_mamba = getattr(args, 'model_type', 'transformer') == 'mamba'
+            max_batch_per_gpu = 256 if is_mamba else 16
             target_batch_size = max_batch_per_gpu * device_count
             if batch_size > target_batch_size:
                 batch_size = target_batch_size
