@@ -137,7 +137,14 @@ def load_model(checkpoint_path, device, override_seq_len=None):
     # mismatch. A shorter --max_sequence_length only limits how long a window we feed
     # through the model during *scoring* (see main()) — the model just uses the first
     # N rows of the same embedding table, which is always valid since N <= native size.
-    model = NetworkBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
+    is_mamba = any("A_log" in k or "conv1d" in k for k in state_dict.keys())
+    if is_mamba:
+        from src.mamba_model import Mamba2NetworkBytePatcher
+        model = Mamba2NetworkBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
+        print(f"Detected Mamba-2 Backbone Checkpoint")
+    else:
+        model = NetworkBytePatcher(max_sequence_length=checkpoint_max_seq_len).to(device)
+        print(f"Detected Transformer Backbone Checkpoint")
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -359,6 +366,12 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available()
                            else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    if device.type == "cuda":
+        try:
+            _ = torch.zeros(1, device=device)
+        except Exception as e:
+            print(f"WARNING: CUDA device acceleration failed ({e}); falling back to CPU.")
+            device = torch.device("cpu")
     print("==================================================")
     print("   ZERO-DAY PROOF-OF-WORK EVALUATION HARNESS")
     print("==================================================")
