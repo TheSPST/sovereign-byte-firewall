@@ -20,6 +20,7 @@ import threading
 import asyncio
 import websockets
 from collections import deque, Counter, defaultdict
+from datetime import datetime, timezone
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +30,7 @@ from src.model import NetworkBytePatcher
 from src.dataloader import RawPcapIterableDataset
 from src.fast_sniffer import parse_packet_fast
 from src.eve_emitter import EveJsonEmitter
+from scapy.all import wrpcap, Ether, Raw
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -65,9 +67,35 @@ def trigger_alert_async(alert_type, message, score=None, enrichment=None):
 # Incident enrichment (deterministic facts, no LLM)
 # ---------------------------------------------------------------------------
 
-def compute_enrichment(pkt_meta):
+def save_pcap_excerpt(pkt_raw_ring, incident_type, output_dir="incidents/excerpts"):
+    """Saves recent raw packet bytes from the ring buffer into a standalone .pcap file.
+    Returns the relative path to the created .pcap file."""
+    if not pkt_raw_ring:
+        return None
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"incident_{ts_str}_{incident_type.lower()}.pcap"
+        filepath = os.path.join(output_dir, filename)
+
+        pkts = []
+        for raw in pkt_raw_ring:
+            try:
+                pkts.append(Ether(raw))
+            except Exception:
+                pkts.append(Raw(raw))
+
+        wrpcap(filepath, pkts)
+        return filepath
+    except Exception as e:
+        logging.warning(f"Could not write PCAP excerpt: {e}")
+        return None
+
+
+def compute_enrichment(pkt_meta, pkt_raw_ring=None, incident_type=None):
     """Summarize the recent packet-metadata ring buffer into human-readable
-    facts an analyst can triage from: top talkers, ports, protocol mix, SYNs.
+    facts an analyst can triage from: top talkers, ports, protocol mix, SYNs,
+    and export a standalone .pcap excerpt if raw packets are provided.
     pkt_meta entries: (ts, src, dst, sport, dport, proto, size, is_syn)."""
     if not pkt_meta:
         return {}
@@ -82,7 +110,12 @@ def compute_enrichment(pkt_meta):
         if is_syn:
             syns += 1
     n = len(pkt_meta)
-    return {
+
+    pcap_path = None
+    if pkt_raw_ring and incident_type:
+        pcap_path = save_pcap_excerpt(pkt_raw_ring, incident_type)
+
+    enr = {
         "packets": n,
         "bytes": total_bytes,
         "top_talkers": [{"pair": k, "bytes": v} for k, v in talkers.most_common(3)],
@@ -90,6 +123,9 @@ def compute_enrichment(pkt_meta):
         "proto_mix_pct": {p: round(100.0 * c / n) for p, c in protos.most_common()},
         "syns": syns,
     }
+    if pcap_path:
+        enr["pcap_excerpt"] = pcap_path
+    return enr
 
 
 def score_percentile(score, calib):
@@ -716,6 +752,7 @@ def sniff_thread(args, device, model, masker, calib=None):
     # Rolling packet-metadata ring buffer (~last 10s) for incident enrichment.
     META_WINDOW = 10.0
     pkt_meta = deque()
+    pkt_raw_ring = deque(maxlen=200)
 
     # Timestamp of the last captured packet (boxed for the capture supervisor's
     # stall watchdog).
@@ -857,7 +894,7 @@ def sniff_thread(args, device, model, masker, calib=None):
         if t_bucket > current_bucket:
             if not is_learning and syn_count > args.rate_threshold:
                 msg = f"Volumetric anomaly detected! {syn_count} SYNs in 100ms window."
-                rate_enr = compute_enrichment(pkt_meta)
+                rate_enr = compute_enrichment(pkt_meta, pkt_raw_ring, "RATE")
                 if aggregator.report("RATE", msg, score=syn_count, enrichment=rate_enr):
                     logging.warning(f"[RATE ALARM] {msg}")
                     meta.record_incident("RATE", rate_enr)
@@ -890,6 +927,7 @@ def sniff_thread(args, device, model, masker, calib=None):
         raw_bytes = bytes(packet)
         if not raw_bytes:
             return
+        pkt_raw_ring.append(raw_bytes)
 
         # Capture packet metadata for incident enrichment (cheap, zero-copy fast parser).
         flow_key = None
@@ -958,44 +996,49 @@ def sniff_thread(args, device, model, masker, calib=None):
                     target_alarmed, target_level = False, 0.0
                     if cusum is not None:
                         flow_alarmed, flow_level = cusum.update(last_pair[0], window_score, now)
-                        if flow_alarmed:
-                            pair = " <-> ".join(sorted(last_pair[0])) if last_pair[0] else "?"
-                            msg = (f"Slow/low anomaly: cumulative surprise {flow_level:.1f} bits from {pair} "
-                                   f"(persistent sub-threshold activity)")
-                            enr = compute_enrichment(pkt_meta)
-                            enr["cusum_level"] = round(flow_level, 1)
-                            if aggregator.report("SLOW", msg, score=flow_level, enrichment=enr):
-                                logging.warning(f"[SLOW ALARM] {msg}")
-                                meta.record_incident("SLOW", enr)
+                    if flow_alarmed:
+                        msg = (f"CUSUM flow alarm! Cumulative surprise for flow {last_pair[0]} = "
+                               f"{flow_level:.2f} bits (h={cusum.h:.1f})")
+                        enr = compute_enrichment(pkt_meta, pkt_raw_ring, "SLOW")
+                        enr["cusum_level"] = round(flow_level, 2)
+                        if aggregator.report("SLOW", msg, score=flow_level, enrichment=enr):
+                            logging.warning(f"[SLOW ALARM] {msg}")
+                            meta.record_incident("SLOW", enr)
 
                     if target_cusum is not None:
                         target_alarmed, target_level = target_cusum.update(last_dst[0], window_score, now)
                         if target_alarmed:
-                            target_str = last_dst[0] if last_dst[0] else "?"
-                            msg = (f"Slow/low distributed anomaly: cumulative surprise {target_level:.1f} bits targeting {target_str} "
-                                   f"(multi-source attack campaign)")
-                            enr = compute_enrichment(pkt_meta)
-                            enr["cusum_level"] = round(target_level, 1)
+                            msg = (f"CUSUM target alarm! Cumulative surprise for target {last_dst[0]} = "
+                                   f"{target_level:.2f} bits (h={target_cusum.h:.1f})")
+                            enr = compute_enrichment(pkt_meta, pkt_raw_ring, "SLOW_DISTRIBUTED")
+                            enr["cusum_level"] = round(target_level, 2)
                             if aggregator.report("SLOW_DISTRIBUTED", msg, score=target_level, enrichment=enr):
-                                logging.warning(f"[SLOW DISTRIBUTED ALARM] {msg}")
+                                logging.warning(f"[SLOW_DISTRIBUTED ALARM] {msg}")
                                 meta.record_incident("SLOW_DISTRIBUTED", enr)
 
                     is_byte_anomaly = window_score > args.byte_threshold
+                    # Static Gold Threshold Hard Ceiling: frozen at calibration time
+                    # (byte_threshold + 3.0), never adapts. Checked independently of
+                    # is_byte_anomaly below so a CRITICAL_BYTE can never be silently
+                    # dropped if adaptive recalibration ever drifts byte_threshold
+                    # past this frozen ceiling.
+                    gold_thr = current_calib.get("gold_threshold") if current_calib else (args.byte_threshold + 3.0)
+                    is_critical_byte = window_score > gold_thr
                     is_any_anomaly = is_byte_anomaly or flow_alarmed or target_alarmed
 
                     # Alert-Excluded Recalibration: only unflagged benign traffic votes on baseline re-fit
                     if not is_any_anomaly:
                         recalib_scores.append(window_score)
 
-                    # Check Static Gold Threshold Hard Ceiling
-                    gold_thr = current_calib.get("gold_threshold") if current_calib else (args.byte_threshold + 3.0)
-                    if window_score > gold_thr:
-                        msg = (f"CRITICAL: Hard static Gold Baseline ceiling breached! Surprise: {window_score:.2f} bits > "
-                               f"gold_threshold {gold_thr:.2f}")
-                        enrich = compute_enrichment(pkt_meta)
-                        if aggregator.report("CRITICAL_BYTE", msg, score=window_score, enrichment=enrich):
-                            logging.critical(f"[CRITICAL BYTE ALARM] {msg}")
-                            meta.record_incident("CRITICAL_BYTE", enrich)
+                    # Normal byte-level anomaly: the operating point the offline
+                    # zero-day eval (evaluate_zero_day.py, --score_agg topk) was
+                    # validated against. CRITICAL_BYTE below is an extra escalation
+                    # layer on top of this, not a replacement for it.
+                    if is_byte_anomaly or is_critical_byte:
+                        pct = score_percentile(window_score, current_calib)
+                        pct_str = f" ({pct}th pct of baseline)" if pct is not None else ""
+                        inc_type_name = "CRITICAL_BYTE" if is_critical_byte else "BYTE"
+                        enrich = compute_enrichment(pkt_meta, pkt_raw_ring, inc_type_name)
                         if pct is not None:
                             enrich["score_percentile"] = pct
                         # Per-byte surprise for the flagged window -> dashboard
@@ -1006,9 +1049,20 @@ def sniff_thread(args, device, model, masker, calib=None):
                             "bytes": [int(b) for b in window[1:]],
                             "surprise": [round(float(x), 2) for x in sb],
                         }
-                        if aggregator.report("BYTE", msg, score=window_score, enrichment=enrich):
-                            logging.critical(f"[BYTE ALARM] {msg}")
-                            meta.record_incident("BYTE", enrich)
+
+                        if is_byte_anomaly:
+                            msg = (f"Payload anomaly detected! Surprise: {window_score:.2f} bits > "
+                                   f"{args.byte_threshold:.2f}{pct_str}")
+                            if aggregator.report("BYTE", msg, score=window_score, enrichment=enrich):
+                                logging.critical(f"[BYTE ALARM] {msg}")
+                                meta.record_incident("BYTE", enrich)
+
+                        if is_critical_byte:
+                            crit_msg = (f"CRITICAL: Hard static Gold Baseline ceiling breached! Surprise: "
+                                        f"{window_score:.2f} bits > gold_threshold {gold_thr:.2f}")
+                            if aggregator.report("CRITICAL_BYTE", crit_msg, score=window_score, enrichment=enrich):
+                                logging.critical(f"[CRITICAL BYTE ALARM] {crit_msg}")
+                                meta.record_incident("CRITICAL_BYTE", enrich)
 
     run_capture_supervised(args.interface, packet_callback, last_pkt, incident_log,
                            retry_secs=args.sniff_retry_secs,
