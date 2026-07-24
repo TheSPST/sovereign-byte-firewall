@@ -111,6 +111,14 @@ def parse_args():
         default=2.0,
         help="Focusing parameter gamma for Focal Loss (default: 2.0)"
     )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Gradient-norm clipping threshold (default 1.0; 0 disables). Bounds the "
+             "damage a single outlier batch can do -- byte traffic is highly "
+             "heterogeneous and unclipped runs collapsed past the LR peak."
+    )
     return parser.parse_args()
 
 def check_preflight_and_device(args):
@@ -219,9 +227,10 @@ def main():
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
         val_dataloader=val_dataloader,
-        total_steps_override=args.total_steps
+        total_steps_override=args.total_steps,
+        max_grad_norm=args.max_grad_norm
     )
-    
+
     print("\nOrchestrated training job completed successfully!")
 
 if __name__ == "__main__":

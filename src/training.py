@@ -118,7 +118,7 @@ def evaluate_validation_loss(model, val_dataloader, criterion, use_focal_loss, a
     return total_loss / steps
 
 
-def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=True, focal_gamma=2.0, checkpoint_interval_steps=5000, val_dataloader=None, total_steps_override=None, max_lr=5e-4):
+def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpoints", lr=1e-4, use_focal_loss=False, focal_gamma=2.0, checkpoint_interval_steps=5000, val_dataloader=None, total_steps_override=None, max_lr=5e-4, max_grad_norm=1.0):
     """
     Unified training loop for Kaggle (T4/P100) and AI Kosh (A100).
     Powered by Hugging Face Accelerate for maximum multi-GPU throughput.
@@ -189,11 +189,23 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
         final_div_factor=10000.0
     )
     
+    # Loss choice. Default changed to plain cross-entropy 2026-07-25. Focal loss
+    # was designed for class-imbalanced *detection*; on a 256-way next-byte
+    # language-modelling objective it downweights confidently-predicted tokens --
+    # which is precisely the signal a surprise-based anomaly score depends on,
+    # since the detector fires on bytes the model finds improbable. Set
+    # use_focal_loss=True to reproduce the earlier runs or to run the A/B.
     if use_focal_loss:
         from src.losses import FocalLoss
         criterion = FocalLoss(gamma=focal_gamma, ignore_index=-1)
+        print(f"[LOSS] FocalLoss(gamma={focal_gamma}) -- non-standard for next-byte LM; "
+              f"use --no_focal_loss for plain cross-entropy.")
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
+        print("[LOSS] CrossEntropyLoss (standard next-byte objective).")
+    print(f"[STABILITY] Gradient clipping max_norm={max_grad_norm}"
+          if max_grad_norm and max_grad_norm > 0 else
+          "[STABILITY] Gradient clipping DISABLED -- runs may collapse after the LR peak.")
         
     # --- ACCELERATE PREPARE ---
     # This automatically distributes the model across GPUs and prepares the dataloader
@@ -313,6 +325,21 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 
                 # Use accelerator.backward instead of loss.backward or scaler.scale
                 accelerator.backward(loss)
+
+                # Gradient clipping. Diagnosis 2026-07-25: training runs repeatedly
+                # collapsed to random (AUC ~0.5, held-out benign FPR ~98%) after the
+                # OneCycleLR peak -- see eval_watcher_results.csv, where gs75000 peaks
+                # then gs105000+ degenerate. Byte-level traffic is extremely
+                # heterogeneous (encrypted payloads are near-uniform, plaintext
+                # protocols are highly predictable), so per-batch gradient norms vary
+                # by orders of magnitude and a single outlier batch can destroy the
+                # learned weights. Lowering max_lr alone did not fix this (the 1e-4
+                # run still collapsed by gs95000). Clipping bounds the damage any one
+                # batch can do.
+                grad_norm = None
+                if accelerator.sync_gradients and max_grad_norm and max_grad_norm > 0:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+
                 optimizer.step()
                 
                 # Unmask the native PyTorch scheduler to check its internal step counter
@@ -327,7 +354,15 @@ def train_patcher_on_kosh(model, dataloader, epochs=5, checkpoint_dir="./checkpo
                 # Log telemetry
                 if step % 100 == 0 and accelerator.is_main_process:
                     log_telemetry_atomic(step, epoch)
-                    print(f"Epoch [{epoch}/{epochs}] | Step {step} | Global {global_step} | Loss: {loss.item():.4f}")
+                    _gn = ""
+                    if grad_norm is not None:
+                        try:
+                            _gn = f" | GradNorm: {float(grad_norm):.3f}"
+                        except (TypeError, ValueError):
+                            _gn = ""
+                    _lr_now = optimizer.param_groups[0].get("lr", float("nan"))
+                    print(f"Epoch [{epoch}/{epochs}] | Step {step} | Global {global_step} "
+                          f"| Loss: {loss.item():.4f}{_gn} | LR: {_lr_now:.2e}")
 
                 # Mid-epoch checkpoint
                 if global_step % checkpoint_interval_steps == 0 and accelerator.is_main_process:

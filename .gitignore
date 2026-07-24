@@ -32,6 +32,11 @@ hf_ckpt_eval/
 
 # Model checkpoints downloaded from HF
 ckpt_best/
+# Root-level checkpoints (weights are distributed via Hugging Face, never git).
+# Pin the HF revision + file hash instead -- filenames get reused across
+# training runs, so a name alone does not identify a set of weights.
+ckpt_*.pt
+*.onnx
 
 # Kaggle scripts and outputs
 kaggle_eval/

@@ -136,6 +136,16 @@ def parse_args():
              "collapsed to random as sustained high LR wrecked the tiny model."
     )
     parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Gradient-norm clipping threshold (default 1.0; 0 disables). Added "
+             "2026-07-25 after eval_watcher_results.csv showed repeated collapse to "
+             "random (AUC ~0.5, held-out benign FPR ~98%%) past the LR peak. Byte "
+             "traffic is highly heterogeneous, so per-batch gradient norms vary by "
+             "orders of magnitude; lowering max_lr alone did not prevent collapse."
+    )
+    parser.add_argument(
         "--allow_resume",
         action="store_true",
         default=False,
@@ -376,7 +386,8 @@ def main():
         focal_gamma=args.focal_gamma,
         val_dataloader=val_dataloader,
         total_steps_override=args.total_steps,
-        max_lr=args.max_lr
+        max_lr=args.max_lr,
+        max_grad_norm=args.max_grad_norm
     )
     print("\nKaggle training script finished successfully!")
 

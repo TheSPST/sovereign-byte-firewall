@@ -12,21 +12,21 @@
 
 \begin{document}
 
-\title{Sovereign Byte Firewall: Zero-Day Intrusion Detection via Mamba-2 State Space Modeling and Extreme Value Theory}
+\title{Sovereign Byte Firewall: Comparing Transformer and Mamba-2 Backbones for Tokenization-Free Zero-Day Network Anomaly Detection}
 
-\author{Shubham~Tomar~(TheSPST)\\
-\IEEEcompsocthanksitem TheSPST is an independent AI and cybersecurity researcher (e-mail: shubhamtomar.spst@gmail.com).}%
+\author{Shubham~Tomar~(TheSPST)%
+\IEEEcompsocitemizethanks{\IEEEcompsocthanksitem TheSPST is an independent AI and cybersecurity researcher (e-mail: shubhamtomar.spst@gmail.com).}}%
 
 \markboth{IEEE TechRxiv Preprint Submission,~July~2026}%
 {TheSPST: Sovereign Byte Firewall}
 
 \IEEEtitleabstractindextext{%
 \begin{abstract}
-The window between zero-day vulnerability disclosure and weaponized exploitation has collapsed from 745 days down to 44 days, rendering signature-based intrusion detection systems (IDS) obsolete against novel attack vectors. Existing machine learning approaches either strip payload contents into coarse flow statistics or suffer from the quadratic $O(T^2)$ computational complexity of Transformer architectures on raw byte streams. In this paper, we present the \textbf{Sovereign Byte Firewall}, an autonomous, tokenization-free network anomaly detection framework powered by Mamba-2 Selective State Space Models (SSM) and Extreme Value Theory (EVT) Peak-Over-Threshold statistical modeling. We trace the complete evolutionary development of the system from initial Transformer baselines through negative typicality experiments, to native C++/CUDA-accelerated Mamba-2 state space architectures with v2 stateful cross-packet masking. Evaluated on over 1.64 Gigabytes of enterprise network traffic across 24 adversarial attack families, our system achieves a \textbf{0.9788 Calibration ROC-AUC}, a \textbf{94.6\% known attack detection rate}, and a \textbf{0.000\% False Positive Rate (0 false alarms out of 34,043 held-out benign windows)} under EVT tail bounds, while detecting \textbf{28.4\% of novel zero-day attack windows}. The model operates with $<2\,\text{ms}$ per-window inference latency, providing an air-gapped, sovereign defense mechanism against modern zero-day threats.
+The window between zero-day vulnerability disclosure and weaponized exploitation has narrowed sharply in recent years, limiting the effectiveness of signature-based intrusion detection against novel payloads. Existing machine learning approaches either strip payload contents into coarse flow statistics or inherit the quadratic $O(T^2)$ complexity of Transformer architectures on raw byte streams. This paper presents the \textbf{Sovereign Byte Firewall}, a tokenization-free network anomaly detector that models raw packet bytes as a next-byte prediction problem and converts per-window information-theoretic surprise into calibrated alerts using Extreme Value Theory (EVT) Peak-Over-Threshold bounds. I evaluate two backbones under a fully matched protocol --- a $1.58$M-parameter causal Transformer and a $0.91$M-parameter Mamba-2 selective state space model --- calibrated on the same benign file and the same $24$ attack families, then scored on the same held-out split of $34{,}043$ benign and $7{,}572$ zero-day attack windows. At the EVT operating point the Transformer detects \textbf{15.0\%} of held-out zero-day windows at a \textbf{0.038\%} false-positive rate, while Mamba-2 detects \textbf{14.1\%} at \textbf{0.1\%}; the target-$1\%$ rule preserves this ordering. Replacing self-attention with a state space backbone therefore did \emph{not} improve detection on this data: its advantage is architectural, delivering comparable detection at $58\%$ of the parameter count with linear-time $O(T)$ processing and constant-memory streaming. Two findings generalize beyond this system: threshold selection moves deployed behaviour more than backbone choice does, and EVT thresholds --- fitted on the benign tail alone --- are invariant to which attack families an operator happens to have labelled, while discriminative rules such as Youden are not. Limitations are stated explicitly, including modest absolute zero-day recall, blindness to encrypted payloads, and reliance on a single training corpus. Both evaluated checkpoints and the evaluation harness are released so that every figure reported here can be independently re-derived.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Network Security, Zero-Day Detection, State Space Models, Mamba-2, Extreme Value Theory, Deep Learning for Cybersecurity.
+Network Security, Zero-Day Detection, State Space Models, Mamba-2, Extreme Value Theory, Anomaly Detection, Reproducibility.
 \end{IEEEkeywords}}
 
 \maketitle
@@ -34,7 +34,7 @@ Network Security, Zero-Day Detection, State Space Models, Mamba-2, Extreme Value
 \IEEEpeerreviewmaketitle
 
 \section{Introduction}
-\IEEEPARstart{N}{etwork} perimeter defense is undergoing a fundamental paradigm shift. Recent cybersecurity data indicates that adversarial AI tools have accelerated the discovery and weaponization of zero-day exploits, reducing the average exploitation window from 745 days in FY2022 to 44 days in FY2026. Traditional security infrastructure fails against this accelerated threat landscape:
+\IEEEPARstart{N}{etwork} perimeter defense is undergoing a fundamental paradigm shift. Industry reporting indicates that adversarial tooling has substantially accelerated the discovery and weaponization of zero-day exploits, compressing the interval between disclosure and exploitation from years to weeks. Traditional security infrastructure fails against this accelerated threat landscape:
 
 \begin{enumerate}
     \item \textbf{Signature-Based IDSs} (e.g., Snort, Suricata) rely on explicit CVE rule databases. They exhibit $0\%$ detection capability against novel or obfuscated zero-day payloads.
@@ -42,7 +42,9 @@ Network Security, Zero-Day Detection, State Space Models, Mamba-2, Extreme Value
     \item \textbf{Transformer-Based Sequence Models} capture byte-level protocol syntax but suffer from $O(T^2)$ quadratic time and memory complexity, creating severe latency bottlenecks on high-throughput perimeter links.
 \end{enumerate}
 
-To bridge this gap, we introduce the \textbf{Sovereign Byte Firewall}, a tokenization-free, unsupervised byte-level anomaly detection system. Our framework leverages the linear-time $O(T)$ recurrence of Mamba-2 Selective State Space Models (SSMs) to learn the underlying information-theoretic grammar of normal network traffic. Combined with Extreme Value Theory (EVT) statistical modeling, our system establishes provable upper bounds on false positives, enabling autonomous zero-day protection on air-gapped perimeter infrastructure.
+To bridge this gap, I introduce the \textbf{Sovereign Byte Firewall}, a tokenization-free, unsupervised byte-level anomaly detection system that learns the information-theoretic grammar of normal network traffic and flags structurally improbable byte sequences. Combined with Extreme Value Theory (EVT) statistical modeling, the system derives principled alert thresholds from the benign tail distribution rather than manual tuning, enabling fully offline zero-day monitoring on air-gapped infrastructure.
+
+A central question for such a system is which sequence backbone to deploy. Mamba-2 selective state space models promise linear-time $O(T)$ processing where self-attention costs $O(T^2)$, and this efficiency argument is frequently assumed to carry an accuracy benefit as well. This paper tests that assumption directly: I evaluate a causal Transformer and a Mamba-2 model under one identical protocol on the same held-out data and report the comparison as measured, including where it contradicts the expected result. The contributions are (i) a byte-level anomaly detector with EVT-calibrated thresholds, (ii) a controlled backbone comparison on identical held-out traffic, and (iii) a candid account of the operating-point and reproducibility issues that dominate deployed behaviour.
 
 \section{Related Work \& Scientific Foundation}
 
@@ -60,7 +62,9 @@ Mamba-2 replaces traditional Multi-Head Self-Attention with a hardware-aware sel
 Discretized via matrix exponential zero-order hold (ZOH) with step size $\Delta$, Mamba-2 achieves $O(T)$ linear-time evaluation during sequence processing and $O(1)$ constant-time recurrent updates during streaming packet scoring.
 
 \subsection{Architectural Trade-Offs: Transformer vs. Mamba-2}
-Initial iterations of our system utilized a Transformer self-attention backbone (\texttt{NetworkBytePatcher}, $d_{\text{model}}=128$). However, Transformer attention maps incurred a quadratic $O(T^2)$ time and VRAM bottleneck as window length $T$ scaled beyond 256 bytes, requiring full $O(T)$ KV-cache expansion during inference. Transitioning to Mamba-2 compressed historical context into a compact state vector $h(t) \in \mathbb{R}^{d_{\text{model}} \times d_{\text{state}}}$, yielding linear $O(T)$ sequence training and constant $O(1)$ streaming inference latency under sub-2ms per-window execution budgets.
+The initial system used a Transformer self-attention backbone (\texttt{NetworkBytePatcher}, $d_{\text{model}}=128$, $4$ heads, $2$ layers). Self-attention incurs quadratic $O(T^2)$ time and memory in window length $T$ and requires KV-cache expansion during autoregressive inference. Mamba-2 instead compresses history into a fixed state vector $h(t) \in \mathbb{R}^{d_{\text{model}} \times d_{\text{state}}}$, giving linear $O(T)$ training and constant $O(1)$ per-token streaming updates.
+
+Two structural consequences matter more for this application than the asymptotics. First, Mamba-2 requires no positional-embedding table: the Transformer allocates $8192 \times 128 = 1{,}048{,}576$ parameters --- $66\%$ of its $1{,}584{,}414$ total --- to positional embeddings, of which only the first $512$ rows are exercised at the deployed window length. Second, constant-memory recurrence makes streaming inference independent of how much traffic has already been observed. These are efficiency and deployment properties. Whether they are accompanied by an accuracy benefit is an empirical question, and Section~\ref{sec:eval} reports that on this data they are not.
 
 \subsection{Information-Theoretic Surprise vs. Typicality}
 Anomaly scoring relies on negative log-likelihood surprise $S(x)$ over window $x = (x_1, x_2, \dots, x_T)$:
@@ -68,21 +72,21 @@ Anomaly scoring relies on negative log-likelihood surprise $S(x)$ over window $x
     S(x) = -\frac{1}{T} \sum_{i=1}^{T} \log_2 P(x_i \mid x_{<i}) \quad [\text{bits/byte}]
 \end{equation}
 
-During system development, we evaluated two-sided typicality scoring $|S(x) - \mu_{\text{benign}}|$ (based on information-theoretic typical set hypothesis). Empirical evaluation revealed that typicality degraded Calibration ROC-AUC from $0.8038$ down to $0.6232$ due to multi-modal enterprise traffic variance, proving that one-sided upper surprise $S(x)$ is mathematically superior for network payload anomaly detection.
+During system development I also evaluated two-sided typicality scoring $|S(x) - \mu_{\text{benign}}|$, motivated by the information-theoretic typical-set hypothesis. On early small-scale experiments typicality scored consistently worse than one-sided surprise, which is the scoring rule used throughout this paper. The exact figures from those early runs are omitted here because the corresponding checkpoints were not retained (Section~\ref{sec:limits}); the negative result is reported for completeness rather than as a quantitative claim.
 
 \subsection{EVT Tail Fitting \& Peak-Over-Threshold}
-To convert raw surprise scores into reliable operational alerts without manual tuning, we apply Extreme Value Theory (EVT) via the Peak-Over-Threshold (POT) method. According to the Pickands-Balkema-de Haan theorem, excesses above a high quantile threshold $u$ follow a Generalized Pareto Distribution (GPD):
+To convert raw surprise scores into reliable operational alerts without manual tuning, I apply Extreme Value Theory (EVT) via the Peak-Over-Threshold (POT) method. According to the Pickands-Balkema-de Haan theorem, excesses above a high quantile threshold $u$ follow a Generalized Pareto Distribution (GPD):
 \begin{equation}
     G_{\xi, \sigma}(y) = 1 - \left( 1 + \frac{\xi y}{\sigma} \right)^{-1/\xi}
 \end{equation}
-where $\xi$ is the shape parameter and $\sigma$ is the scale parameter. Fitting the upper $2\%$ tail of benign calibration score distributions allows us to solve for operational thresholds corresponding to strict target False Positive Rates (e.g., $\text{FPR} = 0.00\%$).
+where $\xi$ is the shape parameter and $\sigma$ is the scale parameter. Fitting the upper $2\%$ tail of the benign calibration score distribution allows a threshold to be solved for a stated target false-positive rate; all EVT results in this paper use a $1\%$ calibration-set target, and the resulting held-out false-positive rates are reported separately in Table~\ref{tab:results} since they differ from the calibration target.
 
 \section{System Architecture \& Engineering}
 
-Our architecture consists of three modular components:
+My architecture consists of three modular components:
 
 \subsection{Cross-Packet Stateful Masking (v2)}
-To prevent neural memory of transient network identifiers, our pipeline implements stateful cross-packet masking:
+To prevent neural memory of transient network identifiers, my pipeline implements stateful cross-packet masking:
 \begin{itemize}
     \item Stochastic masking of MAC addresses, IPv4/IPv6 headers, and TCP/UDP port numbers.
     \item Stateful continuation tracking across TCP packet boundaries to preserve TLS record header state.
@@ -93,58 +97,81 @@ To prevent neural memory of transient network identifiers, our pipeline implemen
 The model embeds raw byte tokens into a $d_{\text{model}} = 128$ dimensional space, followed by $N=2$ stacked Mamba-2 blocks with expansion factor $E=2$, head dimension $h_{\text{dim}}=64$, and state dimension $d_{\text{state}}=64$. The final output projects to a 256-way softmax logit layer.
 
 \subsection{Hardware Acceleration & Prefetching Pipeline}
-To eliminate I/O bottlenecks during streaming training, our DataLoader incorporates background CPU batch prefetching (\texttt{prefetch\_factor=8}, \texttt{persistent\_workers=True}) alongside PyTorch Distributed Data Parallel (DDP) and native C++/CUDA \texttt{selective\_scan\_cuda} kernels, achieving an accelerated training throughput of $\sim 440\,\text{steps/minute}$ on dual NVIDIA Tesla T4 GPUs.
+To eliminate I/O bottlenecks during streaming training, my DataLoader incorporates background CPU batch prefetching (\texttt{prefetch\_factor=8}, \texttt{persistent\_workers=True}) alongside PyTorch Distributed Data Parallel (DDP) and native C++/CUDA \texttt{selective\_scan\_cuda} kernels, achieving an accelerated training throughput of $\sim 440\,\text{steps/minute}$ on dual NVIDIA Tesla T4 GPUs.
 
-\section{Empirical Evaluation \& Historical Trajectory}
+\section{Empirical Evaluation}
+\label{sec:eval}
 
 \subsection{Dataset \& Experimental Setup}
-We evaluated our system using the benchmark CIC-IDS-2017 corpus:
+Both backbones were trained on benign traffic drawn from \texttt{Monday-WorkingHours.pcap} (CIC-IDS-2017), which contains no attack traffic, and were then calibrated and evaluated as follows:
 \begin{itemize}
-    \item \textbf{Training Corpus}: \texttt{Monday-WorkingHours.pcap} ($11.0\,\text{GB}$ of pure benign enterprise traffic).
-    \item \textbf{Calibration Set}: 24 adversarial attack families ($147,711$ Mirai windows, Hydra FTP/SSH, BlackEnergy, Java RCE, NetBIOS, Replay Attacks, etc.).
-    \item \textbf{Held-Out Evaluation}: \texttt{normal2.pcap} ($34,043$ benign windows) and \texttt{0day.pcap} ($7,572$ novel zero-day attack windows).
+    \item \textbf{Benign calibration}: \texttt{normal.pcap} ($13{,}614$ windows), used to fit thresholds only.
+    \item \textbf{Attack calibration}: $24$ labelled attack captures ($\approx 281$k windows spanning Mirai, Hydra FTP/SSH, BlackEnergy, Java RMI, NetBIOS, replay, Zeus and others), used to locate operating points. Both backbones were calibrated against this identical set.
+    \item \textbf{Held-out evaluation}: \texttt{normal2.pcap} ($34{,}043$ benign windows) and \texttt{0day.pcap} ($7{,}572$ zero-day attack windows). Neither file contributes to training or calibration for either model.
 \end{itemize}
 
-\subsection{Full Historical Progression Across Milestones}
+All results use a $512$-byte scoring window and top-$10\%$ surprise aggregation (the mean of the most surprising decile of per-byte scores in each window), with stateful cross-packet masking of MAC addresses, IP headers, and ports enabled.
 
-Table~\ref{tab:results} documents the complete system trajectory from initial Day 0 baselines through dataset scale milestones up to $1.64\,\text{GB}$.
+\subsection{Backbone Comparison}
+
+Table~\ref{tab:results} reports both backbones at three threshold-selection rules under matched calibration, so every column is directly comparable across models.
 
 \begin{table*}[t]
-\caption{Full Project History: Empirical Scaling \& Performance Trajectory}
+\caption{Verified backbone comparison under matched calibration. Both models were calibrated against the identical benign file ($13{,}614$ windows) and the identical $24$ attack families, then scored on the identical held-out split ($34{,}043$ benign windows from \texttt{normal2.pcap}; $7{,}572$ zero-day attack windows from \texttt{0day.pcap}), none of which contributes to training or calibration. Window length $512$ bytes, top-$10\%$ surprise aggregation. All columns are directly comparable across models.}
 \label{tab:results}
 \centering
-\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccc}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}llccccc}
 \toprule
-\textbf{Milestone / Phase} & \textbf{Data Volume} & \textbf{ROC-AUC} & \textbf{Known TPR} & \textbf{Holdout Benign FPR} & \textbf{EVT Benign FPR} & \textbf{Zero-Day DR (EVT)} \\
+\textbf{Backbone} & \textbf{Params} & \textbf{Cal.\ ROC-AUC} & \textbf{Threshold rule} & \textbf{Cal.\ TPR} & \textbf{Held-out benign FPR} & \textbf{Held-out 0-day DR} \\
 \midrule
-Day 0 Transformer & 7.0 MB & 0.8038 & 61.31\% & 0.11\% & 0.11\% & 26.60\% \\
-Typicality Experiment & 7.0 MB & 0.6232 & 41.20\% & 12.40\% & 5.10\% & 11.20\% \\
-Step 5,000 Mamba-2 & 164 MB & 0.9466 & 86.50\% & 44.06\% & 0.50\% & 8.30\% \\
-Step 10,000 Mamba-2 & 675 MB & \textbf{0.9788} & \textbf{94.60\%} & 7.88\% & 0.37\% & 9.50\% \\
-Step 15,000 Mamba-2 & 1.00 GB & 0.9726 & 94.00\% & 2.23\% & 0.12\% & 27.80\% \\
-\textbf{Step 20,000 Mamba-2} & 1.31 GB & 0.7923 & 94.00\% & 0.035\% & \textbf{0.000\%} & \textbf{28.40\%} \\
-\textbf{Step 25,000 (Final)} & \textbf{1.64 GB} & 0.8076 & 94.00\% & \textbf{0.0176\%} & \textbf{0.000\%} & 25.00\% \\
+Transformer            & $1.58$M & $0.7962$ & Youden           & $48.5\%$ & $<0.05\%$ & $18.7\%$ \\
+(\texttt{gs75000})     &         &          & Target $1\%$ FPR & $46.9\%$ & $0.038\%$ & $14.9\%$ \\
+                       &         &          & \textbf{EVT/POT} & ---      & \textbf{0.038\%} & \textbf{15.0\%} \\
+\midrule
+Mamba-2                & $0.91$M & $0.9601$ & Youden           & $91.0\%$ & $2.1\%$   & $33.2\%$ \\
+(\texttt{f05de8b})     &         &          & Target $1\%$ FPR & $63.5\%$ & $0.1\%$   & $14.3\%$ \\
+                       &         &          & \textbf{EVT/POT} & ---      & \textbf{0.1\%}   & \textbf{14.1\%} \\
 \bottomrule
 \end{tabular*}
 \end{table*}
 
 \subsubsection{Key Findings}
 \begin{enumerate}
-    \item \textbf{Exponential FPR Decay}: Scaling dataset exposure from $164\,\text{MB}$ to $1.64\,\text{GB}$ drove holdout false positive rates down from $44.06\%$ to \textbf{0.0176\% (only 6 false alarms out of 34,043 windows)}, representing a $2,500\times$ reduction in false alarms and achieving \textbf{99.982\% benign accuracy}.
-    \item \textbf{Perfect EVT Operational Bound}: Under EVT thresholding ($10.674\,\text{bits}$), the model achieved \textbf{0.000\% FPR (0 false alarms / 34,043 windows)} while maintaining a \textbf{28.4\% zero-day detection rate}.
-    \item \textbf{Peak Attack Separation}: Step 10,000 achieved a peak \textbf{0.9788 Calibration ROC-AUC} and \textbf{94.6\% recall} across 24 attack families.
+    \item \textbf{The state space backbone does not improve detection}: at the two low-false-alarm rules that deployment actually uses, the Transformer modestly but consistently dominates. Under EVT it detects $15.0\%$ of held-out zero-day windows at $0.038\%$ false-positive rate against Mamba-2's $14.1\%$ at $0.1\%$ --- more detection at roughly one-third the false-alarm rate --- and the target-$1\%$ rule gives the same ordering ($14.9\%$ at $0.038\%$ vs.\ $14.3\%$ at $0.1\%$). Mamba-2 reaches a much higher raw detection rate at its Youden point ($33.2\%$), but only by accepting a $2.1\%$ held-out false-positive rate, which at realistic window throughput is far outside any workable alert budget.
+    \item \textbf{The Mamba-2 advantage is structural, not statistical}: $0.91$M parameters against $1.58$M, no positional-embedding table, linear-time processing, and constant-memory streaming. The defensible claim this evidence supports is comparable detection at $58\%$ of the parameter count with better asymptotics --- an efficiency result, not an accuracy one.
+    \item \textbf{EVT thresholds are invariant to the attack set}: because the POT fit uses only the benign calibration tail, the Transformer's EVT threshold was identical ($12.275$ bits) whether calibrated against $14$ or $24$ attack families, while its Youden threshold moved substantially ($11.036 \rightarrow 12.043$ bits) and its held-out detection with it ($32.6\% \rightarrow 18.7\%$). EVT thresholds therefore do not depend on which attacks an operator happens to have labelled --- a practical robustness property that discriminative threshold rules lack.
+    \item \textbf{Calibration ROC-AUC is not a deployment metric}: under matched calibration Mamba-2 still posts a far higher calibration AUC ($0.9601$ vs.\ $0.7962$) while detecting \emph{less} on held-out data at comparable false-alarm rates. AUC integrates across operating points --- including high-FPR regions no deployment would select --- so it should not be used alone to choose between anomaly detectors.
 \end{enumerate}
 
 \section{Limitations \& Operational Scope}
-While our framework demonstrates state-of-the-art anomaly separation and zero false-alarm bounds, full operational deployment introduces specific real-world boundaries:
+\label{sec:limits}
+This system is a complementary detection layer, not a replacement for existing security infrastructure. The following boundaries are material to interpreting the results above:
 \begin{enumerate}
-    \item \textbf{TCP Flow Reassembly}: Evaluated on offline, sequentially captured PCAP streams. Real-world 10\,Gbps line-rate deployment requires a stateful C++/eBPF flow-reassembly engine to handle packet reordering and packet drops across concurrent connections.
-    \item \textbf{Payload Encryption (TLS 1.3 \& QUIC)}: For encrypted application payloads, byte-level surprise is concentrated in unencrypted TLS Handshake negotiations (SNI, cipher suites, certificates) and packet length/timing dynamics, unless an inline TLS decryption proxy is deployed.
-    \item \textbf{Inference Latency Budget}: Per-window FP16 inference latency ($\approx 1.5\,\text{ms}$) necessitates out-of-band TAP/SPAN port deployment or dedicated SmartNIC/DPU hardware offloading for high-speed perimeter links.
+    \item \textbf{Modest absolute zero-day recall}: at the low-false-alarm operating points that deployment requires, both backbones detect roughly $14$--$15\%$ of held-out zero-day \emph{windows}. Campaign-level detection is higher than per-window detection, since a sustained attack generates many windows and any one of them may trip the threshold, but the per-window figure is the honest primitive and is reported as such.
+    \item \textbf{Single training corpus and attack source}: both backbones were trained on benign traffic from one capture (CIC-IDS-2017 Monday) and calibrated against attack families drawn from a single archive. Matched calibration removes the asymmetry between the two models but not the dependence of both on one traffic source; performance on a different network's baseline is untested here.
+    \item \textbf{Checkpoint retention and reproducibility}: intermediate training checkpoints were not preserved, and only the two checkpoints released alongside this paper can be independently re-evaluated. Earlier drafts of this work reported a milestone-by-milestone training progression; those figures were derived from checkpoints that no longer exist and could not be reproduced from the released artifacts, so they have been withdrawn rather than restated. All figures in Table~\ref{tab:results} were re-derived from the released weights using the published harness.
+    \item \textbf{Single-run results}: each figure comes from one training run and one evaluation pass. No seed variance, confidence intervals, or repeated trials are reported, so small differences between the two backbones should not be over-interpreted.
+    \item \textbf{Payload encryption (TLS 1.3 \& QUIC)}: for encrypted payloads, byte-level surprise is concentrated in unencrypted handshake negotiation (SNI, cipher suites, certificates) and in packet length/timing dynamics. Content-level anomalies inside an established tunnel are not visible to this method.
+    \item \textbf{TCP flow reassembly}: evaluation uses offline, sequentially captured PCAP streams. Line-rate deployment would require a stateful flow-reassembly front-end to handle reordering and drops across concurrent connections.
+    \item \textbf{Adversarial evasion}: a patient attacker who keeps every window below the alert threshold evades a memoryless per-window detector by construction. Mitigating this requires cross-window accumulation, which is outside the scope of the results reported here.
 \end{enumerate}
 
 \section{Conclusion}
-We have presented the Sovereign Byte Firewall, demonstrating that Mamba-2 Selective State Space Models combined with Extreme Value Theory achieve near-perfect benign accuracy ($99.982\%$) and robust zero-day threat detection without relying on cloud APIs or CVE signatures. Operating with sub-2ms latency, this framework establishes a viable foundation for sovereign, air-gapped cybersecurity perimeters.
+I have presented the Sovereign Byte Firewall, a tokenization-free byte-level anomaly detector that converts next-byte prediction surprise into EVT-calibrated alerts, and evaluated two sequence backbones under an identical protocol on shared held-out traffic.
+
+The headline result is a negative one, reported as measured: under fully matched calibration, replacing self-attention with a Mamba-2 selective state space model did \emph{not} improve zero-day detection on this data. At the EVT operating point the older Transformer detects $15.0\%$ of held-out zero-day windows at $0.038\%$ false-positive rate against Mamba-2's $14.1\%$ at $0.1\%$, and the target-$1\%$ rule preserves that ordering. What Mamba-2 does deliver is comparable detection at $58\%$ of the parameter count, with linear-time processing, constant-memory streaming, and no positional-embedding table --- an efficiency result rather than an accuracy one, and a useful one for edge deployment on that basis alone.
+
+Three findings generalize beyond this system. First, threshold selection moves deployed behaviour more than backbone choice does: within a single model, shifting between threshold rules changes false-alarm and detection rates more than swapping architectures at a fixed rule. Second, EVT thresholds are invariant to the labelled attack set, since the Peak-Over-Threshold fit uses only the benign tail --- the Transformer's EVT threshold was unchanged at $12.275$ bits under two different attack mixes while its Youden threshold moved by a full bit. For operators whose labelled attack corpus is partial or idiosyncratic, that invariance is worth more than a marginally better discriminative threshold. Third, calibration ROC-AUC is a poor proxy for deployed performance: Mamba-2 posts a far higher calibration AUC while detecting less at comparable false-alarm rates. Practitioners should report detection at a stated false-alarm budget rather than AUC alone.
+
+Both evaluated checkpoints, the evaluation harness, and the exact commands used to produce Table~\ref{tab:results} are released publicly so that every figure here can be independently re-derived.
+
+\section*{Reproducibility}
+Both evaluated checkpoints are publicly available on the Hugging Face Hub:
+\begin{itemize}
+    \item \textbf{Transformer} (\texttt{gs75000}): \texttt{spst01/sovereign-byte-firewall-v2-masking-v2}, file \texttt{checkpoints/latest\_patcher\_ep0\_gs75000\_mid\_epoch.pt} (SHA-256 prefix \texttt{2116ab1b0d3c4415}).
+    \item \textbf{Mamba-2}: \texttt{spst01/sovereign-byte-firewall-mamba2}, revision \texttt{f05de8b}, file \texttt{checkpoints/ckpt\_mamba2.pt} (SHA-256 prefix \texttt{a07e59a356b13c69}).
+\end{itemize}
+Readers should pin both the revision and the file hash, as repository heads advance and filenames are reused across training runs. Table~\ref{tab:results} is reproduced by running \texttt{evaluate\_zero\_day.py} against each checkpoint with \texttt{--score\_agg topk --topk\_frac 0.1 --max\_sequence\_length 512}, the benign and attack calibration files, and the held-out files named in Section~\ref{sec:eval}. Note that the \texttt{eval/} directory bundled in the Transformer repository records an earlier calibration against $14$ attack families and therefore does not match Table~\ref{tab:results}, which uses the matched $24$-family calibration described above.
 
 \section*{Acknowledgment}
 The author thanks the open-source cybersecurity and AI research community for providing benchmark corpora and foundational state space model libraries.

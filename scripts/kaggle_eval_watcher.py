@@ -3,11 +3,22 @@
 kaggle_eval_watcher.py — background per-checkpoint evaluation, in-process on Kaggle.
 
 Runs ALONGSIDE training in the same notebook: launch it (detached) before the
-training cell, and it polls the local checkpoint directory. Each time a NEW
-mid-epoch checkpoint appears, it scores that checkpoint with the project's
-proven signal — per-window surprise, topk-10% aggregation, Youden threshold on
-held-out 0day.pcap (evaluate_zero_day.py) — and appends one row to a CSV plus a
-human-readable verdict against the 32% benchmark.
+training cell, and it polls for new checkpoints. Each time a NEW mid-epoch
+checkpoint appears, it scores that checkpoint (per-window surprise, topk-10%
+aggregation, evaluate_zero_day.py) and appends one row to a CSV.
+
+SELECTION POLICY (revised 2026-07-25) — read this before changing it:
+  * Checkpoints are ranked by held-out detection at the EVT/POT threshold,
+    admissible only if held-out benign FPR stays within --fpr_budget.
+  * Calibration AUC is recorded but NEVER ranked on. Repeatedly in this project
+    AUC has moved opposite to deployed performance.
+  * Degenerate checkpoints are detected and excluded. A collapsed model flags
+    every window and therefore scores 100% detection; the previous version of
+    this script ranked on Youden detection alone and consequently reported
+    exactly those dead checkpoints as "BEATS benchmark — keep this checkpoint".
+  * Mean benign surprise is tracked as an early collapse warning: it rose from
+    8.06 bits at the healthy peak to 10.6 through collapse in the reference run,
+    which is visible well before the detection numbers look absurd.
 
 DESIGN CHOICES (deliberate):
   * Runs on CPU (CUDA_VISIBLE_DEVICES=""). The model is tiny; per-window eval on
@@ -45,7 +56,24 @@ import datetime
 import subprocess
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-BENCHMARK_DETECTION = 0.32   # gs865000 topk10 youden, old masking — the number to beat
+BENCHMARK_DETECTION = 0.15   # best verified EVT held-out detection (gs75000, 24-family calibration)
+
+# --- Checkpoint selection policy (revised 2026-07-25) -----------------------
+# Previously this watcher ranked checkpoints by held-out detection at the YOUDEN
+# threshold and declared anything above 32% a winner. That is actively harmful:
+# a COLLAPSED model flags every window, so it scores detection = 100% at ~98%
+# false-positive rate and was reported as "*** BEATS benchmark — keep this
+# checkpoint ***". eval_watcher_results.csv contains six such rows (gs105000,
+# gs135000, gs165000, gs285000, gs320000, gs365000).
+#
+# Selection now uses the DEPLOYMENT metric: held-out detection at the EVT/POT
+# threshold, admissible only if the checkpoint respects a false-alarm budget.
+# Calibration AUC is logged but never used to rank — across this project it has
+# repeatedly moved opposite to deployed performance (a 0.96-AUC Mamba-2 detects
+# less at matched FPR than a 0.80-AUC Transformer; an lr1e4 run hit 0.942 AUC
+# while detecting 5.5%).
+COLLAPSE_FPR = 0.50      # held-out FPR above this = degenerate "flag everything"
+COLLAPSE_AUC = 0.55      # calibration AUC at/below this = no better than chance
 
 
 def parse_args():
@@ -77,6 +105,26 @@ def parse_args():
                    help="Where per-checkpoint eval artifacts (metrics.json, plots) are "
                         "written. Set this to a local path when running OFF Kaggle "
                         "(e.g. on your Mac): --output_root ./eval_out")
+    p.add_argument("--fpr_budget", type=float, default=0.01,
+                   help="Maximum held-out benign false-positive rate for a checkpoint to "
+                        "be eligible as 'best' (default 0.01 = 1%%). Checkpoints above "
+                        "this are logged but never selected, however high their raw "
+                        "detection rate — this is what stops a collapsed model that "
+                        "flags everything from being crowned the winner.")
+    p.add_argument("--collapse_sigma_drift", type=float, default=1.0,
+                   help="Flag collapse when mean benign surprise rises this many bits "
+                        "above the run's minimum (default 1.0). In the reference run it "
+                        "went 8.06 at the healthy peak to 10.6 through collapse, making "
+                        "this the earliest reliable warning signal.")
+    p.add_argument("--abort_on_collapse", action="store_true",
+                   help="Exit the watcher after --collapse_patience consecutive collapsed "
+                        "checkpoints, so a dead run stops burning session time.")
+    p.add_argument("--collapse_patience", type=int, default=3,
+                   help="Consecutive collapsed checkpoints tolerated before aborting "
+                        "(only meaningful with --abort_on_collapse; default 3)")
+    p.add_argument("--best_json", default=None,
+                   help="Path for the running best-checkpoint record "
+                        "(default: <log_csv dir>/best_checkpoint.json)")
     return p.parse_args()
 
 
@@ -176,30 +224,166 @@ def evaluate(args, ckpt_path):
         return json.load(f)
 
 
+def _operating_points(m):
+    """Extract all three threshold rules plus health signals from metrics.json."""
+    res = m.get("holdout", {}).get("results", {}) or {}
+
+    def pt(rule):
+        d = res.get(rule) or {}
+        return (d.get("holdout_attack_detection_rate"),
+                d.get("holdout_benign_false_positive_rate"))
+
+    evt_dr, evt_fpr = pt("evt")
+    tf_dr, tf_fpr = pt("target_fpr")
+    y_dr, y_fpr = pt("youden")
+    calib = m.get("calibration", {}) or {}
+    return {
+        "auc": calib.get("auc"),
+        "sigma": (calib.get("per_file_mean_score") or {}).get("benign_calibration"),
+        "evt_dr": evt_dr, "evt_fpr": evt_fpr,
+        "tf_dr": tf_dr, "tf_fpr": tf_fpr,
+        "youden_dr": y_dr, "youden_fpr": y_fpr,
+    }
+
+
+def classify(x, sigma_min, drift_limit):
+    """Return (status, reason). COLLAPSED means the checkpoint is degenerate and
+    must never be selected regardless of its raw detection rate."""
+    if x["evt_fpr"] is not None and x["evt_fpr"] > COLLAPSE_FPR:
+        return "COLLAPSED", f"held-out FPR {x['evt_fpr']:.1%} — flagging nearly everything"
+    if x["auc"] is not None and x["auc"] <= COLLAPSE_AUC:
+        return "COLLAPSED", f"calibration AUC {x['auc']:.4f} — at or below chance"
+    if (x["sigma"] is not None and sigma_min is not None
+            and (x["sigma"] - sigma_min) > drift_limit):
+        return "COLLAPSED", (f"benign mean surprise {x['sigma']:.3f} is "
+                             f"+{x['sigma'] - sigma_min:.2f} bits above run minimum "
+                             f"{sigma_min:.3f} — model is losing its baseline")
+    return "OK", ""
+
+
+def selection_metric(x, fpr_budget):
+    """The deployment metric: held-out detection at the EVT threshold, admissible
+    only within the false-alarm budget. Returns None if not eligible."""
+    dr, fpr = x["evt_dr"], x["evt_fpr"]
+    if dr is None or fpr is None:
+        return None
+    if fpr > fpr_budget:
+        return None
+    return float(dr)
+
+
+def _read_prior(log_csv):
+    """(min benign sigma seen, best eligible EVT detection so far, best name)."""
+    sigma_min, best_dr, best_name = None, None, None
+    if not os.path.exists(log_csv):
+        return sigma_min, best_dr, best_name
+    try:
+        with open(log_csv, newline="") as f:
+            for r in csv.DictReader(f):
+                try:
+                    s = float(r.get("benign_sigma_proxy", ""))
+                    sigma_min = s if sigma_min is None else min(sigma_min, s)
+                except (TypeError, ValueError):
+                    pass
+                if r.get("status") == "OK" and r.get("eligible") == "yes":
+                    try:
+                        d = float(r.get("evt_detection", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if best_dr is None or d > best_dr:
+                        best_dr, best_name = d, r.get("checkpoint")
+    except OSError:
+        pass
+    return sigma_min, best_dr, best_name
+
+
+FIELDNAMES = ["timestamp", "checkpoint", "status", "eligible", "calib_auc",
+              "evt_detection", "evt_fpr", "target_fpr_detection", "target_fpr_fpr",
+              "youden_detection", "youden_fpr", "benign_sigma_proxy", "note"]
+
+
 def log_row(args, name, m):
-    y = m["holdout"]["results"].get("youden", {})
+    """Append one row and report a verdict based on the DEPLOYMENT metric.
+
+    Returns True if this checkpoint was collapsed (so the caller can count
+    consecutive failures for --abort_on_collapse).
+    """
+    x = _operating_points(m)
+    sigma_min, best_dr, best_name = _read_prior(args.log_csv)
+    status, reason = classify(x, sigma_min, args.collapse_sigma_drift)
+    sel = selection_metric(x, args.fpr_budget) if status == "OK" else None
+
+    def r4(v):
+        return None if v is None else round(float(v), 6)
+
     row = {
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         "checkpoint": name,
-        "calib_auc": round(m["calibration"]["auc"], 4),
-        "holdout_detection": y.get("holdout_attack_detection_rate"),
-        "holdout_fpr": y.get("holdout_benign_false_positive_rate"),
-        "benign_sigma_proxy": round(
-            m["calibration"]["per_file_mean_score"].get("benign_calibration", float("nan")), 3),
+        "status": status,
+        "eligible": "yes" if sel is not None else "no",
+        "calib_auc": r4(x["auc"]),
+        "evt_detection": r4(x["evt_dr"]),
+        "evt_fpr": r4(x["evt_fpr"]),
+        "target_fpr_detection": r4(x["tf_dr"]),
+        "target_fpr_fpr": r4(x["tf_fpr"]),
+        "youden_detection": r4(x["youden_dr"]),
+        "youden_fpr": r4(x["youden_fpr"]),
+        "benign_sigma_proxy": None if x["sigma"] is None else round(float(x["sigma"]), 3),
+        "note": reason,
     }
+
+    # The CSV schema changed in 2026-07-25; retire an old-schema file rather than
+    # appending mismatched columns to it.
+    if os.path.exists(args.log_csv):
+        try:
+            with open(args.log_csv, newline="") as f:
+                hdr = next(csv.reader(f), [])
+            if hdr and hdr != FIELDNAMES:
+                retired = args.log_csv + ".v1"
+                os.replace(args.log_csv, retired)
+                print(f"[watcher] old-schema CSV retired to {retired}", flush=True)
+        except OSError:
+            pass
+
     exists = os.path.exists(args.log_csv)
     with open(args.log_csv, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(row))
+        w = csv.DictWriter(f, fieldnames=FIELDNAMES)
         if not exists:
             w.writeheader()
         w.writerow(row)
-    det = row["holdout_detection"]
-    verdict = "no holdout number" if det is None else (
-        f"*** BEATS benchmark ({det:.1%} > {BENCHMARK_DETECTION:.0%}) — keep this checkpoint ***"
-        if float(det) > BENCHMARK_DETECTION else
-        f"below benchmark ({det:.1%} vs {BENCHMARK_DETECTION:.0%})")
-    print(f"[watcher] {name}: detection={det} fpr={row['holdout_fpr']} auc={row['calib_auc']} "
-          f"-> {verdict}", flush=True)
+
+    if status == "COLLAPSED":
+        print(f"[watcher] {name}: *** COLLAPSED *** {reason}. "
+              f"(raw youden detection {x['youden_dr']} is meaningless here.)", flush=True)
+        return True
+
+    if sel is None:
+        print(f"[watcher] {name}: NOT ELIGIBLE — held-out FPR {x['evt_fpr']} exceeds budget "
+              f"{args.fpr_budget:.2%}; detection {x['evt_dr']} disregarded.", flush=True)
+        return False
+
+    if best_dr is None or sel > best_dr:
+        verdict = (f"*** NEW BEST *** EVT detection {sel:.2%} @ FPR {x['evt_fpr']:.3%}"
+                   + (f" (previous best {best_dr:.2%}, {best_name})" if best_dr is not None else ""))
+        best_path = args.best_json or os.path.join(
+            os.path.dirname(os.path.abspath(args.log_csv)) or ".", "best_checkpoint.json")
+        try:
+            with open(best_path, "w") as f:
+                json.dump({"checkpoint": name, "evt_detection": sel,
+                           "evt_fpr": x["evt_fpr"], "calib_auc": x["auc"],
+                           "benign_sigma_proxy": x["sigma"],
+                           "selected_at": row["timestamp"],
+                           "criterion": f"max held-out EVT detection s.t. held-out FPR <= "
+                                        f"{args.fpr_budget}"}, f, indent=2)
+        except OSError as e:
+            print(f"[watcher] could not write best record: {e}", flush=True)
+    else:
+        verdict = (f"EVT detection {sel:.2%} @ FPR {x['evt_fpr']:.3%} "
+                   f"(best remains {best_dr:.2%}, {best_name})")
+
+    print(f"[watcher] {name}: {verdict} | auc={row['calib_auc']} (not used for ranking) "
+          f"| benign_mean={row['benign_sigma_proxy']}", flush=True)
+    return False
 
 
 def get_hf_credentials():
@@ -302,8 +486,11 @@ def main():
     preflight(args)
     src_desc = (f"HF repo '{args.hf_repo}'" if args.checkpoint_source == "hf"
                 else f"local dir '{args.checkpoints_dir}'")
-    print(f"[watcher] source: {src_desc} | benchmark {BENCHMARK_DETECTION:.0%} "
-          f"held-out detection | results -> {args.log_csv}", flush=True)
+    print(f"[watcher] source: {src_desc}", flush=True)
+    print(f"[watcher] selection = max held-out EVT detection subject to held-out FPR "
+          f"<= {args.fpr_budget:.2%} (calibration AUC is logged, never ranked on); "
+          f"reference {BENCHMARK_DETECTION:.0%} | results -> {args.log_csv}", flush=True)
+    consecutive_collapsed = 0
     while True:
         try:
             done = already_done(args.log_csv)
@@ -312,7 +499,17 @@ def main():
                 print(f"[watcher] scoring {score_name} ...", flush=True)
                 m = evaluate(args, ckpt_path)
                 if m:
-                    log_row(args, score_name, m)
+                    collapsed = log_row(args, score_name, m)
+                    consecutive_collapsed = consecutive_collapsed + 1 if collapsed else 0
+                    if collapsed and args.abort_on_collapse and \
+                            consecutive_collapsed >= args.collapse_patience:
+                        print(f"[watcher] {consecutive_collapsed} consecutive collapsed "
+                              f"checkpoints — aborting watcher. The run is not recovering; "
+                              f"stop training and inspect gradient norms / LR schedule.",
+                              flush=True)
+                        upload_to_hf(args.log_csv, "eval/eval_watcher_results.csv",
+                                     "final eval log (watcher aborted on collapse)")
+                        return
                     upload_to_hf(args.log_csv, "eval/eval_watcher_results.csv",
                                  f"update eval logs for {score_name}")
                     ckpt_id = os.path.splitext(score_name)[0]
