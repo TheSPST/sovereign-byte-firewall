@@ -39,28 +39,10 @@ def main():
     device = torch.device("cpu")
     print(f"Initializing export process on device: {device}")
 
-    # 3. Load checkpoint metadata dynamically
-    print(f"Loading checkpoint state from '{args.checkpoint_path}'...")
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
-    state_dict = checkpoint['model_state']
-    
-    # Secure tensor extraction to avoid boolean evaluation traps
-    pos_weight = state_dict.get('pos_embedding.weight', None)
-    if pos_weight is None:
-        pos_weight = state_dict.get('module.pos_embedding.weight', None)
-        
-    max_seq_len = pos_weight.shape[0] if pos_weight is not None else 8192
-    print(f"Detected trained sequence length limit: {max_seq_len}")
-
-    # 4. Initialize model
-    model = NetworkBytePatcher(max_patch_size=args.max_patch_size, max_sequence_length=max_seq_len)
-    
-    # Strip any DataParallel wrapper prefixes if present
-    has_prefix = any(k.startswith('module.') for k in state_dict.keys())
-    if has_prefix:
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        
-    model.load_state_dict(state_dict)
+    # 3. Load model using evaluate_zero_day load_model
+    print(f"Loading checkpoint from '{args.checkpoint_path}'...")
+    from evaluate_zero_day import load_model
+    model, max_seq_len = load_model(args.checkpoint_path, device)
     model.eval()
     print("Model state loaded successfully.")
 
