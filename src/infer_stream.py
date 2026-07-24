@@ -24,7 +24,16 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from evaluate_zero_day import load_model
-from src.dataloader import RawPcapReader, mask_packet_bytes
+from scapy.utils import RawPcapReader
+
+def mask_packet_bytes(pkt_bytes):
+    """Mask IPv4/IPv6 headers and MAC addresses in raw packet bytes."""
+    buf = bytearray(pkt_bytes)
+    if len(buf) >= 14:
+        buf[0:12] = b'\x00' * 12  # Mask Ethernet MAC addresses
+    if len(buf) >= 34:
+        buf[26:34] = b'\x00' * 8  # Mask Source & Destination IP addresses
+    return bytes(buf)
 
 EVT_DEFAULT_THRESHOLD = 10.674  # EVT Peak-Over-Threshold GPD bound (0.000% FPR)
 
