@@ -697,13 +697,17 @@ def run_capture_supervised(iface, packet_callback, last_pkt, incident_log,
     forever).
     """
     if sniffer_factory is None:
+        # Force libpcap backend on macOS to avoid Scapy BPF empty-filter
+        # attach_filter crash ('>' not supported between float and NoneType).
+        # libpcap is always available on macOS via system-installed /usr/lib/libpcap.dylib.
+        from scapy.config import conf as scapy_conf
+        scapy_conf.use_pcap = True
+
         def sniffer_factory():
             return AsyncSniffer(
                 iface=iface,
                 prn=packet_callback,
                 store=False,
-                filter="",       # explicit empty BPF filter avoids macOS BPF select_func None crash
-                timeout=None,    # explicitly set to avoid ambiguous default path
             )
     gap_start = None
     restarts = 0
