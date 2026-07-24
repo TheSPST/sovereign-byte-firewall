@@ -26,8 +26,71 @@ except Exception:
 _HAS_MAMBA_SSM = _HAS_MAMBA1 or _HAS_MAMBA2
 
 
+class Mamba2BlockTorch(nn.Module):
+    """Pure PyTorch fallback implementation matching mamba_ssm.Mamba2 state_dict schema."""
+
+    def __init__(self, d_model=128, d_state=64, d_conv=4, expand=2, headdim=64):
+        super().__init__()
+        self.d_model = d_model
+        self.d_inner = expand * d_model
+        self.d_state = d_state
+        self.headdim = headdim
+        self.nheads = self.d_inner // headdim
+        self.d_ssm = self.nheads * self.headdim
+
+        d_in_proj = 2 * self.d_inner + 2 * self.d_state + self.nheads
+        self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
+
+        d_conv_in = self.d_inner + 2 * self.d_state + self.nheads
+        self.conv1d = nn.Conv1d(d_conv_in, d_conv_in, d_conv, groups=d_conv_in, padding=d_conv - 1)
+
+        self.dt_bias = nn.Parameter(torch.ones(self.nheads))
+        self.A_log = nn.Parameter(torch.zeros(self.nheads))
+        self.D = nn.Parameter(torch.ones(self.nheads))
+
+        self.norm = nn.LayerNorm(self.d_inner)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, x):
+        B, L, _ = x.shape
+        zxbcdt = self.in_proj(x)
+        z, xbcdt = zxbcdt.split([self.d_inner, self.d_inner + 2 * self.d_state + self.nheads], dim=-1)
+        xbcdt = self.conv1d(xbcdt.transpose(1, 2))[..., :L].transpose(1, 2)
+        xbcdt = F.silu(xbcdt)
+
+        x_ssm, B_ssm, C_ssm, dt_ssm = torch.split(
+            xbcdt, [self.d_inner, self.d_state, self.d_state, self.nheads], dim=-1
+        )
+
+        dt = F.softplus(dt_ssm + self.dt_bias)
+        A = -torch.exp(self.A_log)
+
+        h = torch.zeros(B, self.nheads, self.headdim, self.d_state, device=x.device, dtype=x.dtype)
+        x_reshaped = x_ssm.view(B, L, self.nheads, self.headdim)
+        ys = []
+        for t in range(L):
+            dt_t = dt[:, t].unsqueeze(-1).unsqueeze(-1)
+            A_t = A.view(1, self.nheads, 1, 1)
+            dA = torch.exp(dt_t * A_t)
+
+            B_t = B_ssm[:, t].unsqueeze(1).unsqueeze(1)
+            x_t = x_reshaped[:, t].unsqueeze(-1)
+
+            dBx = dt_t * (x_t @ B_t)
+            h = dA * h + dBx
+
+            C_t = C_ssm[:, t].unsqueeze(1).unsqueeze(-1)
+            y_t = (h @ C_t).squeeze(-1)
+            ys.append(y_t.view(B, self.d_inner))
+
+        y = torch.stack(ys, dim=1)
+        y = y + x_ssm * self.D.repeat_interleave(self.headdim).view(1, 1, self.d_inner)
+        y = self.norm(y) * F.silu(z)
+        return self.out_proj(y)
+
+
 class MambaBlockTorch(nn.Module):
-    """Self-contained selective-SSM (Mamba/S6) block, pure PyTorch, causal."""
+    """Self-contained selective-SSM (Mamba-1 / S6) block, pure PyTorch, causal."""
 
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
@@ -89,9 +152,9 @@ class MambaBytePatcher(nn.Module):
         elif _HAS_MAMBA1:
             backend = "mamba1"
         else:
-            backend = "torch_scan"
+            backend = "mamba2_torch" if want2 else "torch_scan"
 
-        ds = d_state if d_state is not None else (64 if backend == "mamba2" else 16)
+        ds = d_state if d_state is not None else (64 if "mamba2" in backend else 16)
 
         def make_block():
             if backend == "mamba2":
@@ -99,6 +162,9 @@ class MambaBytePatcher(nn.Module):
                                expand=expand, headdim=headdim)
             if backend == "mamba1":
                 return _Mamba1(d_model=d_model, d_state=ds, d_conv=d_conv, expand=expand)
+            if backend == "mamba2_torch":
+                return Mamba2BlockTorch(d_model=d_model, d_state=ds, d_conv=d_conv,
+                                        expand=expand, headdim=headdim)
             return MambaBlockTorch(d_model, d_state=ds, d_conv=d_conv, expand=expand)
 
         self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_layers)])
