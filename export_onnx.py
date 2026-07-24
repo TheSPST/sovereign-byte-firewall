@@ -62,14 +62,11 @@ def main():
             dummy_input,
             args.output_onnx,
             export_params=True,
-            opset_version=17,  # Opset 17 supports LayerNormalization natively
+            opset_version=18,
             do_constant_folding=True,
             input_names=['input_bytes'],
             output_names=['predicted_logits'],
-            dynamic_axes={
-                'input_bytes': {0: 'batch_size', 1: 'sequence_length'},
-                'predicted_logits': {0: 'batch_size', 1: 'sequence_length'}
-            }
+            dynamo=False
         )
         print(f"SUCCESS: Model successfully compiled and saved to: '{args.output_onnx}' [OK]")
     except Exception as e:
