@@ -306,7 +306,24 @@ def main():
         sys.exit(subprocess.call(cmd))
 
     args = parse_args()
-    
+
+    # 0. Checkpoint upload routing. src/cloud_backup.push_checkpoint() reads the
+    # destination from the HF_REPO_ID *environment variable*, so --hf_repo_id was
+    # previously accepted and silently ignored -- checkpoints went to whatever the
+    # environment happened to hold, or nowhere. That is exactly how a checkpoint
+    # ends up under a name that does not match the run that produced it. Bind the
+    # flag to the environment and say out loud where weights are going.
+    if args.hf_repo_id:
+        os.environ["HF_REPO_ID"] = args.hf_repo_id
+    _dest = os.environ.get("HF_REPO_ID", "").strip()
+    if _dest:
+        print(f"[CHECKPOINTS] Uploading to Hugging Face repo: {_dest}")
+    else:
+        print("[CHECKPOINTS] HF_REPO_ID not set and --hf_repo_id not passed: "
+              "checkpoints stay LOCAL only. Note that training overwrites a single "
+              "latest_patcher.pt, so per-step checkpoints will NOT be recoverable "
+              "and an eval watcher using --checkpoint_source hf will find nothing.")
+
     # 1. Pre-flight checks and scaling configuration
     device, batch_size, max_sequence_length = configure_hardware_limits(args)
     
