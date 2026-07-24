@@ -59,6 +59,9 @@ Mamba-2 replaces traditional Multi-Head Self-Attention with a hardware-aware sel
 \end{equation}
 Discretized via matrix exponential zero-order hold (ZOH) with step size $\Delta$, Mamba-2 achieves $O(T)$ linear-time evaluation during sequence processing and $O(1)$ constant-time recurrent updates during streaming packet scoring.
 
+\subsection{Architectural Trade-Offs: Transformer vs. Mamba-2}
+Initial implementations of raw byte anomaly detectors relied on Transformer self-attention architectures. However, Transformer attention maps incur a quadratic $O(T^2)$ time and memory bottleneck as sequence length $T$ scales, while requiring $O(T)$ KV-cache state expansion during streaming packet evaluation. In contrast, Mamba-2 compresses historical packet context into a fixed-size state vector $h(t) \in \mathbb{R}^{d_{\text{model}} \times d_{\text{state}}}$, enabling linear-time $O(T)$ sequence training and constant $O(1)$ streaming inference latency under $<2\,\text{ms}$ per-window execution budgets.
+
 \subsection{Out-of-Distribution Detection \& EVT Thresholding}
 Information-theoretic anomaly detection measures the surprise $S(x)$ of an incoming sequence $x = (x_1, x_2, \dots, x_T)$ under a generative model $P$:
 \begin{equation}
