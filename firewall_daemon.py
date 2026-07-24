@@ -916,9 +916,16 @@ def sniff_thread(args, device, model, masker, calib=None):
     def packet_callback(packet):
         nonlocal byte_buffer, current_bucket, syn_count, tls_state
 
+        # Guard: Scapy BPF on macOS can pass None on buffer edge cases
+        if packet is None:
+            return
+
         now = time.time()
         last_pkt[0] = now
-        is_syn = bool(TCP in packet and packet[TCP].flags & 0x02)
+        try:
+            is_syn = bool(TCP in packet and packet[TCP].flags & 0x02)
+        except Exception:
+            is_syn = False
 
         # 1. Rate Detector (SYN Flood Check)
         t_bucket = int(now * 10)
