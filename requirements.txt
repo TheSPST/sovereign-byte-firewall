@@ -1,0 +1,19 @@
+# Runtime + test dependencies for sovereign-byte-firewall.
+#
+# torch is intentionally NOT pinned here -- install it separately with the
+# CPU wheel index for CI/lightweight boxes:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# or the default index (CUDA build) on a GPU box:
+#   pip install torch
+#
+# See .github/workflows/tests.yml for the CI install sequence.
+
+scapy>=2.5
+websockets>=12.0
+numpy
+onnxruntime
+accelerate
+pytest
+scikit-learn
+scipy
+matplotlib

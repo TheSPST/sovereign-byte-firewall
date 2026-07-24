@@ -253,3 +253,112 @@ body {
 
 .byte-alert .type { color: var(--accent-red); }
 .rate-alert .type { color: #ffaa00; }
+
+/* --- SLOW_DISTRIBUTED (multi-source botnet campaign) --- */
+.log-entry.slow_distributed-alert {
+    border-left-color: #8b5cf6;
+    background: linear-gradient(90deg, rgba(139, 92, 246, 0.14) 0%, rgba(34, 211, 238, 0.07) 65%, transparent 100%);
+}
+
+.slow_distributed-alert .type {
+    background: linear-gradient(90deg, #a78bfa, #22d3ee);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+
+.badge-campaign {
+    display: inline-block;
+    margin-top: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.78em;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: #0a0a12;
+    background: linear-gradient(90deg, #a78bfa, #22d3ee);
+    box-shadow: 0 0 12px rgba(139, 92, 246, 0.5);
+}
+
+/* --- CRITICAL_BYTE (hard gold ceiling breach) --- */
+.log-entry.critical_byte-alert {
+    border-left-color: #ffd700;
+    background: linear-gradient(90deg, rgba(255, 51, 102, 0.16) 0%, rgba(255, 215, 0, 0.08) 100%);
+}
+
+.critical_byte-alert .type {
+    color: #ffd700;
+    text-shadow: 0 0 8px rgba(255, 51, 102, 0.6);
+}
+
+/* Flashing red/gold critical alert banner on the heatmap panel */
+.critical-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    margin-bottom: 14px;
+    border-radius: 10px;
+    border: 2px solid var(--accent-red);
+    background: rgba(255, 51, 102, 0.16);
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+    animation: flash-critical 0.6s ease-in-out infinite alternate;
+}
+
+.critical-banner.hidden {
+    display: none;
+}
+
+.critical-banner .cb-icon {
+    font-size: 1.3em;
+}
+
+.critical-banner .cb-text {
+    flex: 1;
+    font-weight: 700;
+}
+
+.critical-banner .cb-score {
+    font-weight: 800;
+    padding: 2px 10px;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.3);
+    white-space: nowrap;
+}
+
+.critical-banner .cb-dismiss {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: var(--text-primary);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-family: var(--font-main);
+}
+
+.critical-banner .cb-dismiss:hover {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+@keyframes flash-critical {
+    0% {
+        border-color: var(--accent-red);
+        background: rgba(255, 51, 102, 0.20);
+        box-shadow: 0 0 18px rgba(255, 51, 102, 0.55);
+    }
+    100% {
+        border-color: #ffd700;
+        background: rgba(255, 215, 0, 0.16);
+        box-shadow: 0 0 22px rgba(255, 215, 0, 0.6);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .critical-banner {
+        animation: none;
+        border-color: var(--accent-red);
+        background: rgba(255, 51, 102, 0.18);
+    }
+}

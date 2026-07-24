@@ -1,7 +1,7 @@
 # Project Context - Sovereign Byte-Level Anomaly Detection Engine
 
 ## Metadata
-- **Last Updated:** 2026-07-24T12:00:32+05:30
+- **Last Updated:** 2026-07-24T12:21:00+05:30
 - **Current Phase:** Component 4: Deployment Wrapper & System Verification
 - **Last Successful Test:** 2026-07-07T15:37:05Z
 
@@ -48,7 +48,7 @@ To build an encoder-free, sovereign byte-level network anomaly detection engine 
 
 ## 6. Project Codebase Statistics
 - **Total Source Files:** 11
-- **Total Test Files:** 17
+- **Total Test Files:** 18
 - **File Catalog:**
   - `src/__init__.py`
   - `src/cloud_backup.py`
@@ -78,3 +78,4 @@ To build an encoder-free, sovereign byte-level network anomaly detection engine 
   - `tests/test_pcap_excerpt.py`
   - `tests/test_tls_masking.py`
   - `tests/test_training.py`
+  - `tests/test_zero_day_eval_fallback.py`

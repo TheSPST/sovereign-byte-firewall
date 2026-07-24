@@ -260,6 +260,17 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, num_wo
     return scores
 
 
+def split_calibration_holdout(scores):
+    """Split one file's per-window scores into a (calibration, holdout) pair --
+    first half / second half. Used as a same-file smoke-test fallback in main()
+    when a dedicated distinct calibration or holdout file isn't available (e.g.
+    a minimal 'out-of-the-box' sample dataset that ships only one benign pcap
+    and/or one attack pcap). NOT a substitute for genuinely distinct captures --
+    callers must surface this as a caveat, not a real generalization number."""
+    half = len(scores) // 2
+    return scores[:half], scores[half:]
+
+
 def discover_attack_files(attack_dir, exclude_basenames, max_size_mb=None):
     files = sorted(glob.glob(os.path.join(attack_dir, "*.pcap")))
     filtered = []
@@ -394,29 +405,94 @@ def main():
     print(f"\nCalibration attack files ({len(attack_files)}): "
           f"{[os.path.basename(f) for f in attack_files]}")
 
-    # --- Calibration set ---
-    print(f"\nScoring benign calibration file: {args.benign_calibration_pcap}")
-    benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
-                                num_workers=args.num_workers,
-                                agg=args.score_agg, topk_frac=args.topk_frac,
-                                complexity_correction=args.complexity_correction)
-    print(f"  -> {len(benign_scores)} windows scored")
+    caveats = []
 
+    # --- Calibration set: benign ---
+    # If the calibration and holdout benign files are literally the same path (common
+    # with a minimal "out-of-the-box" sample dataset that only ships one benign pcap),
+    # scoring it twice would silently report a meaningless "held-out" FPR -- it's the
+    # exact same windows, not a genuine generalization check. Score once and split the
+    # windows in half instead, with a loud warning.
+    benign_same_file = os.path.abspath(args.benign_calibration_pcap) == os.path.abspath(args.benign_holdout_pcap)
+    holdout_benign_scores_presplit = None
+    if benign_same_file:
+        msg = (f"--benign_calibration_pcap and --benign_holdout_pcap are the same file "
+               f"('{args.benign_calibration_pcap}'). Falling back to a same-file split "
+               f"(first half of windows = calibration, second half = holdout) instead of "
+               f"double-scoring identical data as if it were held out. This is a SMOKE-TEST "
+               f"split, not a genuine cross-capture generalization check -- pass a distinct "
+               f"--benign_holdout_pcap for a real number.")
+        print(f"\nWARNING: {msg}")
+        caveats.append(msg)
+        print(f"Scoring benign file (calibration + holdout, same-file split): {args.benign_calibration_pcap}")
+        all_benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
+                                        num_workers=args.num_workers,
+                                        agg=args.score_agg, topk_frac=args.topk_frac,
+                                        complexity_correction=args.complexity_correction)
+        benign_scores, holdout_benign_scores_presplit = split_calibration_holdout(all_benign_scores)
+        print(f"  -> {len(all_benign_scores)} windows scored total "
+              f"({len(benign_scores)} calibration / {len(holdout_benign_scores_presplit)} holdout)")
+    else:
+        print(f"\nScoring benign calibration file: {args.benign_calibration_pcap}")
+        benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
+                                    num_workers=args.num_workers,
+                                    agg=args.score_agg, topk_frac=args.topk_frac,
+                                    complexity_correction=args.complexity_correction)
+        print(f"  -> {len(benign_scores)} windows scored")
+
+    # --- Calibration set: attacks ---
+    # Same problem, attack-side: a minimal sample dataset may ship exactly ONE attack
+    # pcap, which discover_attack_files() correctly excludes from calibration because
+    # it's also --holdout_attack_pcap (avoiding leakage) -- but that leaves zero
+    # calibration attack files and the run has nothing to fit a threshold against.
+    # Fall back to scoring that one file once and splitting it, same as above, rather
+    # than hard-erroring on what is otherwise a working pipeline.
     per_file_attack_scores = {}
-    attack_scores = []
-    for f in attack_files:
-        print(f"Scoring attack file: {f}")
-        s = score_pcap(model, f, device, args.batch_size, max_seq_len,
-                        num_workers=args.num_workers,
-                        agg=args.score_agg, topk_frac=args.topk_frac,
-                        complexity_correction=args.complexity_correction)
-        print(f"  -> {len(s)} windows scored")
-        per_file_attack_scores[os.path.basename(f)] = s
-        attack_scores.extend(s)
+    holdout_attack_scores_presplit = None
+    if not attack_files:
+        msg = (f"no calibration attack files found in '{args.attack_dir}' after excluding "
+               f"the benign/holdout files ({sorted(exclude)}). Falling back to a same-file "
+               f"split of the holdout attack file '{args.holdout_attack_pcap}' (first half of "
+               f"windows = calibration, second half = holdout) instead of erroring out. This "
+               f"is a SMOKE-TEST split, not a genuine cross-capture generalization check -- add "
+               f"a second, distinct attack pcap to --attack_dir for a real zero-day proof.")
+        print(f"\nWARNING: {msg}")
+        caveats.append(msg)
+        print(f"Scoring attack file (calibration + holdout, same-file split): {args.holdout_attack_pcap}")
+        all_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
+                                        num_workers=args.num_workers,
+                                        agg=args.score_agg, topk_frac=args.topk_frac,
+                                        complexity_correction=args.complexity_correction)
+        attack_scores, holdout_attack_scores_presplit = split_calibration_holdout(all_attack_scores)
+        per_file_attack_scores[os.path.basename(args.holdout_attack_pcap) + " (calibration half)"] = attack_scores
+        print(f"  -> {len(all_attack_scores)} windows scored total "
+              f"({len(attack_scores)} calibration / {len(holdout_attack_scores_presplit)} holdout)")
+    else:
+        attack_scores = []
+        for f in attack_files:
+            print(f"Scoring attack file: {f}")
+            s = score_pcap(model, f, device, args.batch_size, max_seq_len,
+                            num_workers=args.num_workers,
+                            agg=args.score_agg, topk_frac=args.topk_frac,
+                            complexity_correction=args.complexity_correction)
+            print(f"  -> {len(s)} windows scored")
+            per_file_attack_scores[os.path.basename(f)] = s
+            attack_scores.extend(s)
 
     if not benign_scores or not attack_scores:
-        print("ERROR: Insufficient calibration data (need both benign and attack windows).", file=sys.stderr)
+        print("ERROR: Insufficient calibration data (need both benign and attack windows, even "
+              "after the same-file split fallback -- the source file(s) are too small to yield "
+              "even 2 windows each). Provide a larger sample pcap or a second distinct file.",
+              file=sys.stderr)
         sys.exit(1)
+
+    MIN_RECOMMENDED_WINDOWS = 30
+    if len(benign_scores) < MIN_RECOMMENDED_WINDOWS or len(attack_scores) < MIN_RECOMMENDED_WINDOWS:
+        msg = (f"calibration set is small (benign={len(benign_scores)}, attack={len(attack_scores)} "
+               f"windows). Below ~{MIN_RECOMMENDED_WINDOWS} windows per class, the ROC/threshold "
+               f"numbers below are a pipeline smoke test, not a statistically meaningful benchmark.")
+        print(f"\nWARNING: {msg}")
+        caveats.append(msg)
 
     # --- Optional two-sided typicality transform (arXiv:1906.02994) ---
     # High likelihood is NOT the same as typical: benign traffic concentrates in
@@ -452,19 +528,28 @@ def main():
         print("EVT/POT threshold: skipped (not enough calibration benign windows for a reliable tail fit)")
 
     # --- True held-out generalization check ---
+    # (skipped/reused above when a same-file split fallback already produced these halves)
     print(f"\nScoring HELD-OUT benign file (never used for calibration): {args.benign_holdout_pcap}")
-    holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len,
-                                        num_workers=args.num_workers,
-                                        agg=args.score_agg, topk_frac=args.topk_frac,
-                                        complexity_correction=args.complexity_correction)
-    print(f"  -> {len(holdout_benign_scores)} windows scored")
+    if holdout_benign_scores_presplit is not None:
+        holdout_benign_scores = holdout_benign_scores_presplit
+        print(f"  -> {len(holdout_benign_scores)} windows scored (reused from the same-file split above)")
+    else:
+        holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len,
+                                            num_workers=args.num_workers,
+                                            agg=args.score_agg, topk_frac=args.topk_frac,
+                                            complexity_correction=args.complexity_correction)
+        print(f"  -> {len(holdout_benign_scores)} windows scored")
 
     print(f"Scoring HELD-OUT attack file (never used for calibration): {args.holdout_attack_pcap}")
-    holdout_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
-                                        num_workers=args.num_workers,
-                                        agg=args.score_agg, topk_frac=args.topk_frac,
-                                        complexity_correction=args.complexity_correction)
-    print(f"  -> {len(holdout_attack_scores)} windows scored")
+    if holdout_attack_scores_presplit is not None:
+        holdout_attack_scores = holdout_attack_scores_presplit
+        print(f"  -> {len(holdout_attack_scores)} windows scored (reused from the same-file split above)")
+    else:
+        holdout_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
+                                            num_workers=args.num_workers,
+                                            agg=args.score_agg, topk_frac=args.topk_frac,
+                                            complexity_correction=args.complexity_correction)
+        print(f"  -> {len(holdout_attack_scores)} windows scored")
 
     if typicality_mu is not None:
         # Same transform, same mu (fit on calibration benign only — no leakage).
@@ -492,8 +577,15 @@ def main():
               f"held-out benign FPR={fpr_str} | held-out 0day detection rate={det_str}")
     print("===================================================================\n")
 
+    if caveats:
+        print("\n================ CAVEATS (read before trusting these numbers) ================")
+        for c in caveats:
+            print(f"  - {c}")
+        print("===================================================================\n")
+
     # --- Save artifacts ---
     metrics = {
+        "caveats": caveats,
         "checkpoint_path": args.checkpoint_path,
         "max_sequence_length": max_seq_len,
         "score_agg": args.score_agg,
