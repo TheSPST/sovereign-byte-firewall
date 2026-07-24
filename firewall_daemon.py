@@ -868,8 +868,9 @@ def sniff_thread(args, device, model, masker, calib=None):
         logging.info("Use the network normally (benign traffic only) so the AI can learn this environment's baseline.")
         trigger_alert_async("INFO", f"Calibrating baseline for {args.learning_time}s...")
     else:
+        _thr_display = f"{args.byte_threshold:.2f}" if args.byte_threshold is not None else "(from calibration)"
         logging.info(f"Firewall is LIVE. Monitoring traffic on '{args.interface}' "
-                     f"(byte_threshold={args.byte_threshold:.2f}, dedup_window={args.dedup_window:.0f}s)...")
+                     f"(byte_threshold={_thr_display}, dedup_window={args.dedup_window:.0f}s)...")
 
     def finish_calibration():
         nonlocal is_learning
@@ -1040,13 +1041,15 @@ def sniff_thread(args, device, model, masker, calib=None):
                                 logging.warning(f"[SLOW_DISTRIBUTED ALARM] {msg}")
                                 meta.record_incident("SLOW_DISTRIBUTED", enr)
 
-                    is_byte_anomaly = window_score > args.byte_threshold
+                    _thr = args.byte_threshold if args.byte_threshold is not None else DEFAULT_BYTE_THRESHOLD
+                    is_byte_anomaly = window_score > _thr
                     # Static Gold Threshold Hard Ceiling: frozen at calibration time
                     # (byte_threshold + 3.0), never adapts. Checked independently of
                     # is_byte_anomaly below so a CRITICAL_BYTE can never be silently
                     # dropped if adaptive recalibration ever drifts byte_threshold
                     # past this frozen ceiling.
-                    gold_thr = current_calib.get("gold_threshold") if current_calib else (args.byte_threshold + 3.0)
+                    _base_thr = args.byte_threshold if args.byte_threshold is not None else DEFAULT_BYTE_THRESHOLD
+                    gold_thr = current_calib.get("gold_threshold") if current_calib else (_base_thr + 3.0)
                     is_critical_byte = window_score > gold_thr
                     is_any_anomaly = is_byte_anomaly or flow_alarmed or target_alarmed
 
