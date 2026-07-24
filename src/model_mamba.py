@@ -38,31 +38,35 @@ class Mamba2BlockTorch(nn.Module):
         self.nheads = self.d_inner // headdim
         self.d_ssm = self.nheads * self.headdim
 
+        # in_proj outputs: [z (d_inner), x (d_inner), B (d_state), C (d_state), dt (nheads)] -> total 2*d_inner + 2*d_state + nheads (644)
         d_in_proj = 2 * self.d_inner + 2 * self.d_state + self.nheads
         self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
 
-        d_conv_in = self.d_inner + 2 * self.d_state + self.nheads
+        # conv1d processes [x, B, C] -> total d_inner + 2*d_state (384)
+        d_conv_in = self.d_inner + 2 * self.d_state
         self.conv1d = nn.Conv1d(d_conv_in, d_conv_in, d_conv, groups=d_conv_in, padding=d_conv - 1)
 
         self.dt_bias = nn.Parameter(torch.ones(self.nheads))
         self.A_log = nn.Parameter(torch.zeros(self.nheads))
         self.D = nn.Parameter(torch.ones(self.nheads))
 
-        self.norm = nn.LayerNorm(self.d_inner)
+        self.norm = nn.LayerNorm(self.d_inner, bias=False)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
     def forward(self, x):
         B, L, _ = x.shape
         zxbcdt = self.in_proj(x)
-        z, xbcdt = zxbcdt.split([self.d_inner, self.d_inner + 2 * self.d_state + self.nheads], dim=-1)
-        xbcdt = self.conv1d(xbcdt.transpose(1, 2))[..., :L].transpose(1, 2)
-        xbcdt = F.silu(xbcdt)
+        z, xbc, dt_raw = torch.split(
+            zxbcdt, [self.d_inner, self.d_inner + 2 * self.d_state, self.nheads], dim=-1
+        )
+        xbc = self.conv1d(xbc.transpose(1, 2))[..., :L].transpose(1, 2)
+        xbc = F.silu(xbc)
 
-        x_ssm, B_ssm, C_ssm, dt_ssm = torch.split(
-            xbcdt, [self.d_inner, self.d_state, self.d_state, self.nheads], dim=-1
+        x_ssm, B_ssm, C_ssm = torch.split(
+            xbc, [self.d_inner, self.d_state, self.d_state], dim=-1
         )
 
-        dt = F.softplus(dt_ssm + self.dt_bias)
+        dt = F.softplus(dt_raw + self.dt_bias)
         A = -torch.exp(self.A_log)
 
         h = torch.zeros(B, self.nheads, self.headdim, self.d_state, device=x.device, dtype=x.dtype)
