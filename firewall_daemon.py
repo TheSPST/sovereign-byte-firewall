@@ -697,17 +697,20 @@ def run_capture_supervised(iface, packet_callback, last_pkt, incident_log,
     forever).
     """
     if sniffer_factory is None:
-        # Force libpcap backend on macOS to avoid Scapy BPF empty-filter
-        # attach_filter crash ('>' not supported between float and NoneType).
-        # libpcap is always available on macOS via system-installed /usr/lib/libpcap.dylib.
+        # Scapy 2.7.0 bug: when timeout=None, AsyncSniffer._run() passes
+        # remain=None to select_func which internally does remain > 0,
+        # crashing with 'float > NoneType'. Fix: pass a concrete timeout so
+        # remain is always a float. run_capture_supervised restarts automatically
+        # on expiry, so timeout=3600 effectively runs forever.
         from scapy.config import conf as scapy_conf
-        scapy_conf.use_pcap = True
+        scapy_conf.use_pcap = False  # use native BPF for raw L2 access
 
         def sniffer_factory():
             return AsyncSniffer(
                 iface=iface,
                 prn=packet_callback,
                 store=False,
+                timeout=3600,  # restarts every hour via run_capture_supervised
             )
     gap_start = None
     restarts = 0
