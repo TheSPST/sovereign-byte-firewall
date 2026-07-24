@@ -698,7 +698,13 @@ def run_capture_supervised(iface, packet_callback, last_pkt, incident_log,
     """
     if sniffer_factory is None:
         def sniffer_factory():
-            return AsyncSniffer(iface=iface, prn=packet_callback, store=False)
+            return AsyncSniffer(
+                iface=iface,
+                prn=packet_callback,
+                store=False,
+                filter="",       # explicit empty BPF filter avoids macOS BPF select_func None crash
+                timeout=None,    # explicitly set to avoid ambiguous default path
+            )
     gap_start = None
     restarts = 0
     while True:
