@@ -45,6 +45,12 @@
                 <h2>Byte Surprise Heatmap — what the model saw</h2>
                 <span id="heatmap-caption" style="color:var(--text-secondary);font-family:var(--font-mono);font-size:0.85em;">no flagged window yet</span>
             </div>
+            <div id="critical-banner" class="critical-banner hidden" role="alert" aria-live="assertive">
+                <span class="cb-icon" aria-hidden="true">⚠️</span>
+                <span class="cb-text" id="critical-banner-text">Critical alert</span>
+                <span class="cb-score" id="critical-banner-score">0.00 bits</span>
+                <button class="cb-dismiss" id="critical-banner-dismiss" type="button">Dismiss</button>
+            </div>
             <canvas id="heatmap-canvas" width="768" height="384" style="width:100%;height:auto;display:block;border-radius:8px;background:#0a0a12;"></canvas>
             <div style="display:flex;gap:18px;margin-top:10px;font-family:var(--font-mono);font-size:0.8em;color:var(--text-secondary);">
                 <span><span style="display:inline-block;width:11px;height:11px;border-radius:2px;background:rgb(0,210,45);vertical-align:-1px;"></span> expected (low surprise)</span>
@@ -52,6 +58,17 @@
                 <span><span style="display:inline-block;width:11px;height:11px;border-radius:2px;background:rgb(255,45,45);vertical-align:-1px;"></span> anomalous (high surprise)</span>
             </div>
             <div id="heatmap-tooltip" style="position:fixed;pointer-events:none;display:none;background:rgba(10,10,18,0.95);border:1px solid var(--glass-border);color:var(--text-primary);font-family:var(--font-mono);font-size:0.8em;padding:6px 8px;border-radius:6px;z-index:50;"></div>
+        </div>
+
+        <!-- Active IPS Banned IPs Panel -->
+        <div class="glass-panel" style="margin-bottom: 20px; padding: 16px;">
+            <div class="panel-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <h2 style="font-size:1.1em; color:var(--accent-red); margin:0;">🚫 Banned & Blocked IPs (Active IPS Enforcement)</h2>
+                <span id="banned-count-badge" style="background:rgba(0,210,45,0.15); color:var(--accent-green); font-family:var(--font-mono); padding:2px 8px; border-radius:12px; font-size:0.85em; font-weight:700;">0 Banned</span>
+            </div>
+            <div id="banned-ips-list" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap:12px;">
+                <div style="color:var(--text-secondary); font-family:var(--font-mono); font-size:0.85em;">No active IP bans enforced</div>
+            </div>
         </div>
 
         <!-- Main Dashboard -->

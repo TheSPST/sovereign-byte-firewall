@@ -1,7 +1,7 @@
 # Project Context - Sovereign Byte-Level Anomaly Detection Engine
 
 ## Metadata
-- **Last Updated:** 2026-07-24T10:11:44+05:30
+- **Last Updated:** 2026-07-24T10:22:48+05:30
 - **Current Phase:** Component 4: Deployment Wrapper & System Verification
 - **Last Successful Test:** 2026-07-07T15:37:05Z
 
@@ -47,14 +47,15 @@ To build an encoder-free, sovereign byte-level network anomaly detection engine 
 ---
 
 ## 6. Project Codebase Statistics
-- **Total Source Files:** 9
-- **Total Test Files:** 16
+- **Total Source Files:** 10
+- **Total Test Files:** 17
 - **File Catalog:**
   - `src/__init__.py`
   - `src/cloud_backup.py`
   - `src/dataloader.py`
   - `src/eve_emitter.py`
   - `src/fast_sniffer.py`
+  - `src/ips_enforcer.py`
   - `src/losses.py`
   - `src/model.py`
   - `src/sniffer.py`
@@ -68,6 +69,7 @@ To build an encoder-free, sovereign byte-level network anomaly detection engine 
   - `tests/test_fast_sniffer.py`
   - `tests/test_flow_buffer.py`
   - `tests/test_gold_ceiling_fix.py`
+  - `tests/test_ips_enforcement.py`
   - `tests/test_losses.py`
   - `tests/test_low_hanging_fruits.py`
   - `tests/test_model.py`

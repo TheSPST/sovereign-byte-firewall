@@ -10,6 +10,14 @@ const statMaxEntropy = document.getElementById('stat-max-entropy');
 const logsContainer = document.getElementById('live-logs');
 const clearBtn = document.getElementById('clear-logs');
 
+// Critical banner (CRITICAL_BYTE — hard Gold Ceiling breach)
+const criticalBanner = document.getElementById('critical-banner');
+const criticalBannerText = document.getElementById('critical-banner-text');
+const criticalBannerScore = document.getElementById('critical-banner-score');
+const criticalBannerDismiss = document.getElementById('critical-banner-dismiss');
+const CRITICAL_BANNER_DURATION_MS = 8000;
+let criticalBannerTimer = null;
+
 // State
 let byteCount = 0;
 let rateCount = 0;
@@ -73,6 +81,38 @@ if (heatmapCanvas) {
     heatmapCanvas.addEventListener('mouseleave', () => { heatmapTooltip.style.display = 'none'; });
 }
 
+// Pull "targeting <host>" out of the SLOW_DISTRIBUTED message text so the
+// campaign badge can show the target without needing a backend change.
+function extractTarget(message) {
+    const m = /targeting (\S+)/.exec(message || '');
+    return m ? m[1] : null;
+}
+
+// --- CRITICAL_BYTE: flashing red/gold banner on the heatmap panel ---
+function showCriticalBanner(data) {
+    if (!criticalBanner) return;
+    criticalBannerText.textContent = data.message;
+    const scoreVal = parseFloat(data.score);
+    criticalBannerScore.textContent = Number.isFinite(scoreVal) ? `${scoreVal.toFixed(2)} bits` : '';
+    criticalBanner.classList.remove('hidden');
+    // A new CRITICAL_BYTE while the banner is already up resets the clock
+    // instead of letting it disappear mid-campaign.
+    clearTimeout(criticalBannerTimer);
+    criticalBannerTimer = setTimeout(hideCriticalBanner, CRITICAL_BANNER_DURATION_MS);
+}
+
+function hideCriticalBanner() {
+    if (!criticalBanner) return;
+    criticalBanner.classList.add('hidden');
+}
+
+if (criticalBannerDismiss) {
+    criticalBannerDismiss.addEventListener('click', () => {
+        clearTimeout(criticalBannerTimer);
+        hideCriticalBanner();
+    });
+}
+
 function formatEnrichment(e) {
     if (!e || Object.keys(e).length === 0) return '';
     const parts = [];
@@ -111,6 +151,16 @@ function addLog(type, score, message, timestamp, enrichment) {
     const msgSpan = document.createElement('span');
     msgSpan.className = 'msg';
     msgSpan.textContent = message;
+
+    // SLOW_DISTRIBUTED: multi-source botnet campaign badge with the target host.
+    if (type === 'SLOW_DISTRIBUTED') {
+        const target = extractTarget(message);
+        const badge = document.createElement('span');
+        badge.className = 'badge-campaign';
+        badge.textContent = target ? `⚡ BOTNET CAMPAIGN → ${target}` : '⚡ BOTNET CAMPAIGN';
+        msgSpan.appendChild(document.createElement('br'));
+        msgSpan.appendChild(badge);
+    }
 
     // Enrichment line (computed facts) shown under the message when present.
     const ctx = formatEnrichment(enrichment);
@@ -162,6 +212,40 @@ function updateStats(type, score) {
     }, 1000);
 }
 
+function renderBannedIPs(bannedList) {
+    const listContainer = document.getElementById('banned-ips-list');
+    const badge = document.getElementById('banned-count-badge');
+    if (!listContainer) return;
+
+    if (!bannedList || bannedList.length === 0) {
+        badge.textContent = "0 Banned";
+        badge.style.background = "rgba(0, 210, 45, 0.15)";
+        badge.style.color = "var(--accent-green)";
+        listContainer.innerHTML = '<div style="color:var(--text-secondary); font-family:var(--font-mono); font-size:0.85em;">No active IP bans enforced</div>';
+        return;
+    }
+
+    badge.textContent = `${bannedList.length} Banned`;
+    badge.style.background = "rgba(255, 51, 102, 0.2)";
+    badge.style.color = "var(--accent-red)";
+
+    listContainer.innerHTML = '';
+    bannedList.forEach(item => {
+        const card = document.createElement('div');
+        card.style.cssText = 'background:rgba(255,51,102,0.08); border:1px solid rgba(255,51,102,0.3); border-radius:8px; padding:10px 12px; font-family:var(--font-mono); font-size:0.85em; display:flex; flex-direction:column; gap:4px;';
+        
+        card.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-weight:800; color:var(--accent-red); font-size:1.05em;">🚫 ${item.ip}</span>
+                <span style="background:rgba(0,0,0,0.4); padding:2px 6px; border-radius:4px; font-size:0.75em; color:var(--text-secondary);">${item.remaining_secs}s TTL</span>
+            </div>
+            <div style="color:var(--text-primary); font-weight:600; margin-top:2px;">Reason: ${item.reason || 'Anomaly Detected'}</div>
+            <div style="color:var(--text-secondary); font-size:0.75em;">Threat: <span style="color:#ffd700;">${item.incident_type}</span> • Banned at ${item.banned_at_iso}</div>
+        `;
+        listContainer.appendChild(card);
+    });
+}
+
 function connect() {
     ws = new WebSocket(WS_URL);
     
@@ -178,6 +262,12 @@ function connect() {
         const data = JSON.parse(event.data);
         if (data.enrichment && data.enrichment.heatmap) {
             renderHeatmap(data.enrichment.heatmap);
+        }
+        if (data.banned_ips || (data.enrichment && data.enrichment.banned_ips)) {
+            renderBannedIPs(data.banned_ips || data.enrichment.banned_ips);
+        }
+        if (data.type === 'CRITICAL_BYTE') {
+            showCriticalBanner(data);
         }
         addLog(data.type, data.score, data.message, data.timestamp, data.enrichment);
         updateStats(data.type, data.score);

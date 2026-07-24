@@ -30,6 +30,7 @@ from src.model import NetworkBytePatcher
 from src.dataloader import RawPcapIterableDataset
 from src.fast_sniffer import parse_packet_fast
 from src.eve_emitter import EveJsonEmitter
+from src.ips_enforcer import IPSEnforcer
 from scapy.all import wrpcap, Ether, Raw
 
 # Initialize logger
@@ -51,7 +52,7 @@ async def broadcast_alert(alert_data):
         message = json.dumps(alert_data)
         websockets.broadcast(CONNECTED_CLIENTS, message)
 
-def trigger_alert_async(alert_type, message, score=None, enrichment=None):
+def trigger_alert_async(alert_type, message, score=None, enrichment=None, banned_ips=None):
     if loop is not None:
         alert_data = {
             "timestamp": time.time(),
@@ -59,6 +60,7 @@ def trigger_alert_async(alert_type, message, score=None, enrichment=None):
             "message": message,
             "score": score,
             "enrichment": enrichment or {},
+            "banned_ips": banned_ips or [],
         }
         asyncio.run_coroutine_threadsafe(broadcast_alert(alert_data), loop)
 
@@ -209,6 +211,10 @@ def parse_args():
                         help="Optional UDP Syslog host (e.g. 192.168.1.50)")
     parser.add_argument("--syslog_port", type=int, default=514,
                         help="UDP Syslog port (default 514)")
+    parser.add_argument("--enable_ips", action="store_true", default=False,
+                        help="Enable active IPS kernel packet dropping (pfctl on macOS / iptables on Linux)")
+    parser.add_argument("--ban_ttl", type=float, default=900.0,
+                        help="TTL in seconds for dynamic IP bans (default: 900s = 15 min)")
     parser.add_argument("--sniff_retry_secs", type=float, default=10.0,
                         help="Seconds between capture restart attempts after the interface drops "
                              "(e.g. Wi-Fi flap during a long run; default 10)")
@@ -775,7 +781,25 @@ def sniff_thread(args, device, model, masker, calib=None):
     if args.syslog_host:
         logging.info(f"Syslog RFC 5424 streaming -> {args.syslog_host}:{args.syslog_port}")
 
-    aggregator = IncidentAggregator(args.dedup_window, trigger_alert_async, incident_log=incident_log, eve_emitter=eve_emitter)
+    # Active IPS Enforcement Engine
+    ips = IPSEnforcer(enabled=args.enable_ips, default_ttl=args.ban_ttl)
+
+    def trigger_alert_with_ips(alert_type, message, score=None, enrichment=None):
+        src_ip = None
+        if enrichment:
+            tt = enrichment.get("top_talkers")
+            if tt and len(tt) > 0:
+                pair = tt[0].get("pair") if isinstance(tt[0], dict) else str(tt[0])
+                if " -> " in pair:
+                    src_ip = pair.split(" -> ")[0].strip()
+        if src_ip and alert_type in ("CRITICAL_BYTE", "SLOW_DISTRIBUTED", "BYTE", "SLOW", "RATE"):
+            ips.ban_ip(src_ip, reason=message, incident_type=alert_type, ttl_secs=args.ban_ttl)
+            if enrichment is not None:
+                enrichment["banned_ips"] = ips.get_active_bans()
+
+        trigger_alert_async(alert_type, message, score, enrichment, banned_ips=ips.get_active_bans())
+
+    aggregator = IncidentAggregator(args.dedup_window, trigger_alert_with_ips, incident_log=incident_log, eve_emitter=eve_emitter)
 
     # A.1 CUSUM slow-low detector + A.2 hourly meta-event reporter
     cusum = CusumTracker(k_sigma=args.cusum_k_sigma, h=args.cusum_h,
