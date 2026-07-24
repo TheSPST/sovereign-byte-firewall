@@ -63,14 +63,15 @@ from src.dataloader import get_pcap_dataloader
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Zero-day proof-of-work evaluation harness")
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/latest_patcher.pt")
-    parser.add_argument("--benign_calibration_pcap", type=str, default="scratch/archive_upload/normal.pcap",
+    parser.add_argument("--checkpoint_path", "--ckpt", type=str, default="checkpoints/latest_patcher.pt",
+                         help="Path to trained PyTorch model checkpoint")
+    parser.add_argument("--benign_calibration_pcap", "--pcap", type=str, default="local_test.pcap",
                          help="Benign traffic used to fit the threshold (label=0)")
-    parser.add_argument("--benign_holdout_pcap", type=str, default="scratch/archive_upload/normal2.pcap",
+    parser.add_argument("--benign_holdout_pcap", type=str, default="dummy.pcap",
                          help="Benign traffic NEVER used for threshold fitting (final FPR check)")
-    parser.add_argument("--attack_dir", type=str, default="scratch/archive_upload",
+    parser.add_argument("--attack_dir", type=str, default="data",
                          help="Directory of labeled attack pcaps used to fit the threshold (label=1)")
-    parser.add_argument("--holdout_attack_pcap", type=str, default="scratch/archive_upload/0day.pcap",
+    parser.add_argument("--holdout_attack_pcap", type=str, default="data/Mirai_pcap.pcap",
                          help="Attack file NEVER used for threshold fitting (final recall check)")
     parser.add_argument("--max_sequence_length", type=int, default=None,
                          help="Override sequence length; auto-detected from checkpoint by default")
