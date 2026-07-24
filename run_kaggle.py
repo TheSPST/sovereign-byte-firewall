@@ -284,6 +284,16 @@ def configure_hardware_limits(args):
     return device, batch_size, max_sequence_length
 
 def main():
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1 and "LOCAL_RANK" not in os.environ:
+        print(f"\n[MULTI-GPU DETECTED] Relaunching via 'accelerate launch' across {torch.cuda.device_count()} GPUs...")
+        cmd = [
+            "accelerate", "launch",
+            "--num_processes", str(torch.cuda.device_count()),
+            "--mixed_precision", "fp16",
+            sys.argv[0]
+        ] + sys.argv[1:]
+        sys.exit(subprocess.call(cmd))
+
     args = parse_args()
     
     # 1. Pre-flight checks and scaling configuration
