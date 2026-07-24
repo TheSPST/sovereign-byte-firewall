@@ -582,15 +582,15 @@ class AdaptiveRecalibrator:
                  interval=900.0, max_step=1.0, cap=3.0, min_samples=5000, enabled=True):
         self.budget_q = budget_q
         self.ref_pct = ref_pct
-        self.anchor_threshold = anchor_threshold
-        self.anchor_ref = anchor_ref
-        self.cur_threshold = anchor_threshold
-        self.cur_ref = anchor_ref
+        self.cur_threshold = anchor_threshold if anchor_threshold is not None else 12.0
+        self.cur_ref = anchor_ref if anchor_ref is not None else 8.0
+        self.anchor_threshold = anchor_threshold if anchor_threshold is not None else 12.0
+        self.anchor_ref = anchor_ref if anchor_ref is not None else 8.0
         self.interval = interval
         self.max_step = max_step
         self.cap = cap
         self.min_samples = min_samples
-        self.enabled = enabled and (budget_q is not None) and (anchor_threshold is not None)
+        self.enabled = enabled and (budget_q is not None) and (anchor_threshold is not None) and (anchor_ref is not None)
         self.last = time.time()
 
     @staticmethod
@@ -926,6 +926,14 @@ def sniff_thread(args, device, model, masker, calib=None):
         # Guard: Scapy BPF on macOS can pass None on buffer edge cases
         if packet is None:
             return
+
+        try:
+            _packet_callback_inner(packet)
+        except Exception as _cb_exc:
+            logging.debug(f"[packet_callback] non-fatal exception dropped: {_cb_exc!r}")
+
+    def _packet_callback_inner(packet):
+        nonlocal byte_buffer, current_bucket, syn_count, tls_state
 
         now = time.time()
         last_pkt[0] = now
