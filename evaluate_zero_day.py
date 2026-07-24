@@ -75,7 +75,8 @@ def parse_args():
                          help="Attack file NEVER used for threshold fitting (final recall check)")
     parser.add_argument("--max_sequence_length", type=int, default=None,
                          help="Override sequence length; auto-detected from checkpoint by default")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=None,
+                         help="Inference batch size (default: auto — 512 for CUDA, 32 otherwise)")
     parser.add_argument("--target_fpr", type=float, default=0.01,
                          help="Additionally report the threshold nearest this false-positive rate")
     parser.add_argument("--evt_tail_quantile", type=float, default=0.98,
@@ -110,8 +111,12 @@ def parse_args():
                               "TOO-predictable as well as too-surprising. Catches low-entropy "
                               "attacks (padding floods, repeated probes, C2 heartbeats) that "
                               "one-sided surprise misses by construction.")
-    parser.add_argument("--num_workers", type=int, default=0,
-                         help="Number of background workers for data loading (default: 0)")
+    parser.add_argument("--num_workers", type=int, default=None,
+                         help="Number of background workers for data loading (default: auto — 4 for CUDA, 0 otherwise)")
+    parser.add_argument("--fp16", action="store_true", default=False,
+                         help="Use FP16 mixed-precision inference (faster on CUDA, auto-enabled on CUDA unless --no_fp16 is set)")
+    parser.add_argument("--no_fp16", action="store_true", default=False,
+                         help="Disable automatic FP16 inference even on CUDA")
     parser.add_argument("--max_pcap_size_mb", type=float, default=None,
                          help="Skip files in the calibration attack directory larger than this MB size (default: None)")
     return parser.parse_args()
@@ -176,8 +181,9 @@ def _window_complexity_bits_per_byte(rows, method):
 
 
 @torch.no_grad()
-def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, num_workers=0, agg="mean", topk_frac=0.1,
-               complexity_correction="none"):
+def score_pcap(model, pcap_path, device, batch_size, max_sequence_length,
+               num_workers=0, agg="mean", topk_frac=0.1,
+               complexity_correction="none", use_fp16=False):
     """
     Returns a list of per-window "surprise" scores (bits) — negative log2
     probability the model assigned to the true next byte in each window,
@@ -202,62 +208,68 @@ def score_pcap(model, pcap_path, device, batch_size, max_sequence_length, num_wo
         batch_size=batch_size,
         num_workers=num_workers,
         max_sequence_length=max_sequence_length,
+        pin_memory=(device.type == "cuda"),
         # Eval must not pollute data/anomaly_labels.csv with side-channel rows,
         # and skipping the per-packet scapy parse roughly halves scoring time.
         label_anomalies=False,
     )
 
     scores = []
-    for batch in dataloader:
-        comp_bits = None
-        if complexity_correction != "none":
-            # Complexity of the TARGET bytes (batch[:, 1:]), matching what the
-            # surprise score is computed over. Done on the CPU copy pre-transfer.
-            comp_bits = _window_complexity_bits_per_byte(batch[:, 1:].numpy(), complexity_correction)
-        batch = batch.to(device)
-        inputs = batch[:, :-1]
-        targets = batch[:, 1:]
-        valid_mask = targets != -1
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_fp16 else torch.amp.autocast("cpu", enabled=False)
+    with torch.no_grad(), amp_ctx:
+        for batch in dataloader:
+            comp_bits = None
+            if complexity_correction != "none":
+                # Complexity of the TARGET bytes (batch[:, 1:]), matching what the
+                # surprise score is computed over. Done on the CPU copy pre-transfer.
+                comp_bits = _window_complexity_bits_per_byte(batch[:, 1:].numpy(), complexity_correction)
+            batch = batch.to(device, non_blocking=True)
+            inputs = batch[:, :-1]
+            targets = batch[:, 1:]
+            valid_mask = targets != -1
 
-        logits = model(inputs)  # model handles -1 clamping internally
-        log_probs = F.log_softmax(logits, dim=-1)
+            logits = model(inputs)  # model handles -1 clamping internally
+            # Cast back to float32 for numerical stability of log_softmax
+            logits = logits.float()
+            log_probs = F.log_softmax(logits, dim=-1)
 
-        gather_idx = torch.clamp(targets, min=0).unsqueeze(-1)
-        token_logprob = log_probs.gather(-1, gather_idx).squeeze(-1)
-        surprise_bits = -token_logprob / math.log(2)
+            gather_idx = torch.clamp(targets, min=0).unsqueeze(-1)
+            token_logprob = log_probs.gather(-1, gather_idx).squeeze(-1)
+            surprise_bits = -token_logprob / math.log(2)
 
-        valid_counts = valid_mask.sum(dim=1)
+            valid_counts = valid_mask.sum(dim=1)
 
-        if agg == "mean":
-            surprise_masked = surprise_bits.masked_fill(~valid_mask, float("nan"))
-            per_window = torch.nanmean(surprise_masked, dim=1)
-        elif agg == "max":
-            filled = torch.where(valid_mask, surprise_bits, torch.full_like(surprise_bits, float("-inf")))
-            per_window = filled.max(dim=1).values
-            per_window = torch.where(valid_counts > 0, per_window, torch.full_like(per_window, float("nan")))
-        elif agg == "topk":
-            filled = torch.where(valid_mask, surprise_bits, torch.full_like(surprise_bits, float("-inf")))
-            k = max(1, min(filled.shape[1], int(round(topk_frac * filled.shape[1]))))
-            topk_vals, _ = torch.topk(filled, k=k, dim=1)
-            topk_valid = torch.isfinite(topk_vals)
-            topk_vals = torch.where(topk_valid, topk_vals, torch.zeros_like(topk_vals))
-            denom = topk_valid.sum(dim=1).clamp(min=1)
-            per_window = topk_vals.sum(dim=1) / denom
-            per_window = torch.where(valid_counts > 0, per_window, torch.full_like(per_window, float("nan")))
-        else:
-            raise ValueError(f"Unknown --score_agg: {agg}")
+            if agg == "mean":
+                surprise_masked = surprise_bits.masked_fill(~valid_mask, float("nan"))
+                per_window = torch.nanmean(surprise_masked, dim=1)
+            elif agg == "max":
+                filled = torch.where(valid_mask, surprise_bits, torch.full_like(surprise_bits, float("-inf")))
+                per_window = filled.max(dim=1).values
+                per_window = torch.where(valid_counts > 0, per_window, torch.full_like(per_window, float("nan")))
+            elif agg == "topk":
+                filled = torch.where(valid_mask, surprise_bits, torch.full_like(surprise_bits, float("-inf")))
+                k = max(1, min(filled.shape[1], int(round(topk_frac * filled.shape[1]))))
+                topk_vals, _ = torch.topk(filled, k=k, dim=1)
+                topk_valid = torch.isfinite(topk_vals)
+                topk_vals = torch.where(topk_valid, topk_vals, torch.zeros_like(topk_vals))
+                denom = topk_valid.sum(dim=1).clamp(min=1)
+                per_window = topk_vals.sum(dim=1) / denom
+                per_window = torch.where(valid_counts > 0, per_window, torch.full_like(per_window, float("nan")))
+            else:
+                raise ValueError(f"Unknown --score_agg: {agg}")
 
-        per_window = per_window.cpu().numpy()
-        if comp_bits is not None:
-            # Likelihood-ratio-style correction: S = NLL - L (both bits/byte).
-            # For agg="mean" this is exactly Serra et al.'s parameter-free OOD
-            # score restricted to the window; for max/topk it is the same
-            # correction applied to the aggregated statistic (heuristic but
-            # consistently applied to benign and attack windows alike).
-            per_window = per_window - comp_bits
-        scores.extend([s for s in per_window.tolist() if not math.isnan(s)])
+            per_window = per_window.cpu().numpy()
+            if comp_bits is not None:
+                # Likelihood-ratio-style correction: S = NLL - L (both bits/byte).
+                # For agg="mean" this is exactly Serra et al.'s parameter-free OOD
+                # score restricted to the window; for max/topk it is the same
+                # correction applied to the aggregated statistic (heuristic but
+                # consistently applied to benign and attack windows alike).
+                per_window = per_window - comp_bits
+            scores.extend([s for s in per_window.tolist() if not math.isnan(s)])
 
     return scores
+
 
 
 def split_calibration_holdout(scores):
@@ -383,6 +395,19 @@ def main():
         except Exception as e:
             print(f"WARNING: CUDA device acceleration failed ({e}); falling back to CPU.")
             device = torch.device("cpu")
+
+    # Auto-scale batch_size and num_workers based on device
+    if args.batch_size is None:
+        args.batch_size = 512 if device.type == "cuda" else 32
+    if args.num_workers is None:
+        args.num_workers = 4 if device.type == "cuda" else 0
+
+    # Auto-enable FP16 on CUDA unless explicitly disabled
+    use_fp16 = (device.type == "cuda") and (not args.no_fp16)
+    if args.fp16:
+        use_fp16 = True  # explicit override
+    if use_fp16:
+        print(f"FP16 AMP inference: ENABLED (use --no_fp16 to disable)")
     print("==================================================")
     print("   ZERO-DAY PROOF-OF-WORK EVALUATION HARNESS")
     print("==================================================")
@@ -396,6 +421,13 @@ def main():
 
     model, max_seq_len = load_model(args.checkpoint_path, device, args.max_sequence_length)
 
+    # Wrap with DataParallel if multiple GPUs are available
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Multi-GPU: wrapping model with DataParallel across {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+
+    print(f"Batch size: {args.batch_size} | DataLoader workers: {args.num_workers}")
+
     exclude = {
         os.path.basename(args.benign_calibration_pcap),
         os.path.basename(args.benign_holdout_pcap),
@@ -404,6 +436,7 @@ def main():
     attack_files = discover_attack_files(args.attack_dir, exclude, max_size_mb=args.max_pcap_size_mb)
     print(f"\nCalibration attack files ({len(attack_files)}): "
           f"{[os.path.basename(f) for f in attack_files]}")
+
 
     caveats = []
 
@@ -428,7 +461,8 @@ def main():
         all_benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
                                         num_workers=args.num_workers,
                                         agg=args.score_agg, topk_frac=args.topk_frac,
-                                        complexity_correction=args.complexity_correction)
+                                        complexity_correction=args.complexity_correction,
+                                        use_fp16=use_fp16)
         benign_scores, holdout_benign_scores_presplit = split_calibration_holdout(all_benign_scores)
         print(f"  -> {len(all_benign_scores)} windows scored total "
               f"({len(benign_scores)} calibration / {len(holdout_benign_scores_presplit)} holdout)")
@@ -437,7 +471,8 @@ def main():
         benign_scores = score_pcap(model, args.benign_calibration_pcap, device, args.batch_size, max_seq_len,
                                     num_workers=args.num_workers,
                                     agg=args.score_agg, topk_frac=args.topk_frac,
-                                    complexity_correction=args.complexity_correction)
+                                    complexity_correction=args.complexity_correction,
+                                    use_fp16=use_fp16)
         print(f"  -> {len(benign_scores)} windows scored")
 
     # --- Calibration set: attacks ---
@@ -462,7 +497,8 @@ def main():
         all_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
                                         num_workers=args.num_workers,
                                         agg=args.score_agg, topk_frac=args.topk_frac,
-                                        complexity_correction=args.complexity_correction)
+                                        complexity_correction=args.complexity_correction,
+                                        use_fp16=use_fp16)
         attack_scores, holdout_attack_scores_presplit = split_calibration_holdout(all_attack_scores)
         per_file_attack_scores[os.path.basename(args.holdout_attack_pcap) + " (calibration half)"] = attack_scores
         print(f"  -> {len(all_attack_scores)} windows scored total "
@@ -474,7 +510,8 @@ def main():
             s = score_pcap(model, f, device, args.batch_size, max_seq_len,
                             num_workers=args.num_workers,
                             agg=args.score_agg, topk_frac=args.topk_frac,
-                            complexity_correction=args.complexity_correction)
+                            complexity_correction=args.complexity_correction,
+                            use_fp16=use_fp16)
             print(f"  -> {len(s)} windows scored")
             per_file_attack_scores[os.path.basename(f)] = s
             attack_scores.extend(s)
@@ -537,7 +574,8 @@ def main():
         holdout_benign_scores = score_pcap(model, args.benign_holdout_pcap, device, args.batch_size, max_seq_len,
                                             num_workers=args.num_workers,
                                             agg=args.score_agg, topk_frac=args.topk_frac,
-                                            complexity_correction=args.complexity_correction)
+                                            complexity_correction=args.complexity_correction,
+                                            use_fp16=use_fp16)
         print(f"  -> {len(holdout_benign_scores)} windows scored")
 
     print(f"Scoring HELD-OUT attack file (never used for calibration): {args.holdout_attack_pcap}")
@@ -548,7 +586,8 @@ def main():
         holdout_attack_scores = score_pcap(model, args.holdout_attack_pcap, device, args.batch_size, max_seq_len,
                                             num_workers=args.num_workers,
                                             agg=args.score_agg, topk_frac=args.topk_frac,
-                                            complexity_correction=args.complexity_correction)
+                                            complexity_correction=args.complexity_correction,
+                                            use_fp16=use_fp16)
         print(f"  -> {len(holdout_attack_scores)} windows scored")
 
     if typicality_mu is not None:
